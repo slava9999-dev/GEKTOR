@@ -1,0 +1,10 @@
+{
+  "bridge_version": "1.0.0",
+  "status": "running",
+  "last_sync": "2026-02-22T20:41:12.844725",
+  "inbox_pending": 0,
+  "outbox_pending": 0,
+  "antigravity_available": true,
+  "last_heartbeat": null,
+  "errors": []
+}

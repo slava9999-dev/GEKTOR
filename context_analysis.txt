@@ -1,0 +1,11 @@
+============================================================
+Traceback (most recent call last):
+  File "C:\Gerald-superBrain\scripts\calc_context.py", line 129, in <module>
+    ctx = calculate_context_limits()
+  File "C:\Gerald-superBrain\scripts\calc_context.py", line 44, in calculate_context_limits
+    print("\U0001f9e0 Gerald-SuperBrain: Context Window Reality Check")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\╧юы№чютрЄхы№\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1251.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f9e0' in position 0: character maps to <undefined>
