@@ -127,7 +127,7 @@ def process_request(filename):
         env["OLLAMA_API_KEY"] = "ollama-local"
         
         result = subprocess.run(
-            ["npx", "openclaw", "agent", "--agent", "main", "--message", prompt],
+            ["npx", "--yes", "openclaw", "agent", "--agent", "main", "--message", prompt],
             capture_output=True,
             text=True,
             encoding='utf-8',
