@@ -3,6 +3,7 @@ Gerald-SuperBrain: Antigravity Bridge Daemon
 Actively monitors the bridge directory for incoming requests and process them.
 """
 import os
+import sys
 import time
 import json
 import subprocess
@@ -49,15 +50,19 @@ def process_request(filename):
             os.remove(file_path)
             return
 
-        # Call OpenClaw Agent
-        # Note: We use global openclaw install since it's an npm package
+        # Call OpenClaw Agent with proper auth and agent selection
+        env = os.environ.copy()
+        env["OLLAMA_API_KEY"] = "ollama-local"
+        
         result = subprocess.run(
-            ["openclaw", "agent", "--message", prompt],
+            ["openclaw", "agent", "--agent", "main", "--message", prompt],
             capture_output=True,
             text=True,
             encoding='utf-8',
             cwd=BASE_DIR,
-            timeout=60
+            env=env,
+            shell=True, # Required on Windows for npm commands
+            timeout=300 # Increased timeout for deep reasoning
         )
         
         response_file = os.path.join(OUTBOX, filename.replace(".msg", ".resp"))
@@ -106,8 +111,15 @@ def main():
             # Maintenance every hour
             if now_ts - last_maintenance_time > 3600:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] 🛠 Running scheduled maintenance...")
-                subprocess.run(["python", os.path.join(BASE_DIR, "scripts", "maintenance.py")], 
-                               capture_output=True)
+                try:
+                    m_path = os.path.join(BASE_DIR, "scripts", "maintenance.py")
+                    if os.path.exists(m_path):
+                        subprocess.run([sys.executable, m_path], capture_output=True, timeout=300)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Maintenance complete.")
+                    else:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ maintenance.py not found at {m_path}")
+                except Exception as me:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Maintenance error: {me}")
                 last_maintenance_time = now_ts
 
             if not safe:

@@ -72,24 +72,31 @@ L6: Web (search/fetch tools)    → Доступен через OpenClaw tools
 
 ---
 
+## 🟢 Состояние системы (LIVE)
+
+```
+RAG:          Локальный (transformers/all-MiniLM-L6-v2) ✅ (Убрали зависимость от OpenAI)
+Telegram:     NeuroExpertСryptoBot (@derslava_bot) ✅ (Связь со Славой установлена)
+Bridge:       Активен, shell=True fix применен ✅
+Self-Healing: Reflector + Maintenance интегрированы ✅
+```
+
+---
+
 ## 🔴 Оставшиеся задачи
 
 ### Высокий приоритет
 
-1. **Gerald не использует RAG автоматически** — отвечает из контекста, не ищет в ChromaDB
-   - Нужно: настроить RAG skill или tool в OpenClaw для автопоиска
-2. **Tool-use не протестирован** — read/exec/browser tools
+1. **Тестирование Торгового Модуля** — Проверка связи с Bybit через Gerald.
+2. **Мониторинг ликвидности** — Настройка алертов на крупные ордера через Telegram.
 
-### Средний приоритет
+### Завершенные этапы (DONE)
 
-3. **Bridge Daemon** — не протестирован с qwen2.5:7b
-4. **Telegram bot** — нет токена
-5. **Gateway auth** — нужен persistent fix (сейчас через env var)
-
-### Низкий приоритет
-
-6. **Индексация Desktop субпапок** — Desktop/LOCAL NEUROEXPERT и CryptoExpertAgent обнаружены, но их можно добавить явно в SCAN_PATHS
-7. **Расписание переиндексации** — cron/Task Scheduler для index_files.py
+- Настройка 32k контекста.
+- Индексация 26к+ чанков кода.
+- Исправление Gateway Auth (OLLAMA_API_KEY).
+- Создание Telegram-скилла для Геральда.
+- Локализация эмбеддингов.
 
 ---
 

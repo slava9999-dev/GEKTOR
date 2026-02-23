@@ -60,8 +60,13 @@ def gpu_safety_check():
 def main():
     print(f"[{datetime.now().isoformat()}] 🛠 Running Gerald Maintenance...")
     
-    # 1. Self-Healing
+    # 1. Self-Healing & Reflection
     check_docker_chroma()
+    try:
+        reflector_path = os.path.join(BASE_DIR, "scripts", "reflector.py")
+        subprocess.run([sys.executable, reflector_path], capture_output=True)
+    except:
+        pass
     
     # 2. Housekeeping
     prune_logs()
