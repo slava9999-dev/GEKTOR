@@ -1,151 +1,123 @@
-# SESSION CHECKPOINT — 2026-02-23
+# SESSION CHECKPOINT — 2026-02-23 (Updated 16:40)
 
-## 🎯 Статус: Gerald РАБОТАЕТ через OpenClaw
-
-Gerald успешно отвечает текстом по-русски через OpenClaw + Ollama.
+## 🎯 Статус: Gerald ПОЛНОСТЬЮ РАБОТАЕТ — 32k контекст + RAG 26k чанков
 
 ---
 
-## ✅ Что сделано в этой сессии
+## ✅ Что сделано в этой сессии (обновление)
 
-### 1. Диагностика и исправление модели
+### Приоритет 1: Git ✅
 
-| Модель                    | Проблема                             | Результат                  |
-| ------------------------- | ------------------------------------ | -------------------------- |
-| qwen2.5-coder:14b         | NO_REPLY (tool-calling loop)         | ❌ Не работает как primary |
-| mistral-nemo:latest (12B) | CUDA OOM на 8GB VRAM                 | ❌ Не помещается           |
-| mistral:latest (7B)       | Работает, но НЕ знает русский        | ⚠️ Только English          |
-| **qwen2.5:7b**            | **Работает! Русский + tool-calling** | ✅ **PRIMARY**             |
+- `git init` → initial commit `3a0e901`
+- Все изменения коммитятся: `5c6b261` (indexer + config sync)
 
-### 2. Изменённые файлы
+### Приоритет 2: Контекст 32k ✅
 
-#### `~/.openclaw/openclaw.json`
+- `num_ctx` увеличен с 16384 → **32768** в `~/.openclaw/openclaw.json`
+- Реальный бюджет разговора: **~22k токенов** (было ~3k!)
+- Gerald подтвердил: "Мой контекст ~22k токенов"
+- Расчёт GPU: model 4.7GB + KV cache 1.75GB = 6.45GB из 8GB VRAM ✅
 
-- Primary model: `ollama/qwen2.5:7b` (alias: `gerald-main`)
-- Fallbacks: `mistral:latest`, `qwen2.5-coder:14b`
-- qwen2.5:7b params: num_ctx=16384, num_gpu=35, temp=0.7
-- Все модели имеют настроенные params
+### Приоритет 3: RAG Индексация ✅
 
-#### `~/.openclaw/workspace/AGENTS.md`
+- Создан `scripts/index_files.py` — полноценный файловый индексер
+- **4,235 файлов** проиндексировано → **26,792 чанков** в ChromaDB
+- Коллекция `gerald-files` — поиск по всему компьютеру
+- Покрытие: 23 директории (все проекты, документы, рабочий стол)
+- Инкрементальная индексация (повторный запуск сканирует только изменённые файлы)
+- Поиск работает: "telegram bot token" → находит 3 файла из разных проектов
 
-- Сокращён с 7,783 → 1,087 символов (86% reduction)
-- Добавлена инструкция: "ALWAYS respond in Russian"
-- Добавлено: "For simple questions, respond with text — do NOT call tools"
+### Приоритет 4: Config Sync ✅
 
-#### `~/.openclaw/workspace/SOUL.md`
+- `~/.openclaw/openclaw.json` — qwen2.5:7b primary, 32k ctx
+- `.openclaw/config.json` (проект) — синхронизирован
+- `MEMORY.md` — обновлён (убраны устаревшие данные)
+- `SOUL.md` (обе копии) — context window 32k
+- `BOOTSTRAP.md` — очищен (экономия ~400 токенов/сессия)
+- `TOOLS.md` — заполнен реальными портами/сервисами
+- `init_chroma.py` — seed-данные обновлены
 
-- Engine обновлён: qwen2.5:7b primary (было qwen2.5-coder:14b)
-- Context window: 16k (было 16k — неверно, фактически было 8k)
-- Thermal: убрана ссылка на mistral-nemo (OOM)
+### Приоритет 5: Gateway Auth ✅
 
-#### `~/.openclaw/workspace/IDENTITY.md`
-
-- Заполнен (был пустым шаблоном)
-- Gerald, Emoji 🧠, Russian primary, qwen2.5:7b
-
-#### `~/.openclaw/agents/main/agent/models.json`
-
-- ⚠️ Gateway перегенерирует этот файл! Ручные правки не сохраняются.
-- contextWindow остаётся 128000 (метаданные OpenClaw, не num_ctx)
-
-### 3. Скачанные модели Ollama
-
-- qwen2.5:7b (4.7GB) — NEW, основная модель Gerald
-- mistral:latest (4.1GB) — fallback
-- mistral-nemo:latest (12B) — не используется (OOM)
-- qwen2.5-coder:14b (8.9GB) — для тяжёлого кода через прямой API
+- Проблема: gateway не находил API ключ для Ollama
+- Решение: `$env:OLLAMA_API_KEY = "ollama-local"` перед запуском gateway
+- Создан `start-gerald.bat` / `start-gerald.ps1` — startup с автоустановкой env
 
 ---
 
-## 🔴 Нерешённые проблемы
-
-### 1. Контекст почти полностью занят промптом
-
-- System prompt: ~13,248 tokens из 16,384
-- Conversation budget: ~3,136 tokens (5-6 сообщений)
-- **Нужно увеличить num_ctx до 32768** (Qwen 7B поддерживает, VRAM хватит)
-
-### 2. ChromaDB RAG не работает как нужно
-
-- Сервер ChromaDB должен работать на localhost:8000
-- Нужен скрипт индексации файлов компьютера
-- Gerald должен автоматически искать в RAG перед ответом
-
-### 3. Gerald не знает содержимое компьютера
-
-- Нужна многослойная память (L1-L6 architecture)
-- L4 (ChromaDB RAG) — ключевой слой для "знания всего на компе"
-- Нужен indexer pipeline: scan dirs → chunk files → embed → store in Chroma
-
-### 4. Git не инициализирован
-
-- `c:\Gerald-superBrain` — нет .git
-- Все изменения незащищены
-
-### 5. Bridge Daemon не протестирован
-
-- bridge_daemon.py может быть устаревшим
-- Нужно проверить совместимость с qwen2.5:7b
-
-### 6. Tool-use не протестирован
-
-- Gerald отвечает текстом ✅
-- Но может ли он использовать read/exec/browser tools? Не проверено.
-
----
-
-## 📐 Текущая архитектура памяти (TO-DO)
+## 📊 Текущее состояние системы
 
 ```
-L1: Context (always loaded)     → SOUL.md, IDENTITY.md, AGENTS.md, USER.md
-L2: Session (conversation)      → ~3k tokens (мало!)
-L3: Curated (MEMORY.md)         → ~600 tokens
-L4: RAG (ChromaDB)              → НЕ НАСТРОЕН — ключевой приоритет
+Hardware:     RTX 4070 Laptop (8GB VRAM), 16GB RAM, 953GB SSD
+Ollama:       qwen2.5:7b (primary), mistral:latest, qwen2.5-coder:14b
+OpenClaw:     v2026.2.21-2, gateway mode local
+ChromaDB:     Docker :8000, 7 collections, 26,796 documents total
+Gerald:       32k context, ~22k conversation budget, Russian, tool-calling
+Git:          Initialized, 2 commits on master
+Docker:       8 containers (chroma, n8n, postgres, redis×2, mongo, adminer, redis-commander)
+```
+
+---
+
+## 📐 Текущая архитектура памяти
+
+```
+L1: Context (always loaded)     → SOUL.md, IDENTITY.md, AGENTS.md, USER.md (~7k tokens)
+L2: Session (conversation)      → ~22k tokens ✅ (было ~3k)
+L3: Curated (MEMORY.md)         → ~800 tokens (обновлён)
+L4: RAG (ChromaDB)              → 26,792 чанков из 4,235 файлов ✅
 L5: File System (read tool)     → Доступен через OpenClaw tools
 L6: Web (search/fetch tools)    → Доступен через OpenClaw tools
 ```
 
 ---
 
-## 🎯 Приоритеты следующей сессии
+## 🔴 Оставшиеся задачи
 
-1. **Увеличить num_ctx до 32768** — удвоить бюджет контекста
-2. **Настроить ChromaDB indexer** — проиндексировать все файлы
-3. **Протестировать tool-use** — read, exec, memory tools
-4. **Git init** — защитить изменения
-5. **Оптимизировать промпт** — убрать лишнее из контекста
+### Высокий приоритет
+
+1. **Gerald не использует RAG автоматически** — отвечает из контекста, не ищет в ChromaDB
+   - Нужно: настроить RAG skill или tool в OpenClaw для автопоиска
+2. **Tool-use не протестирован** — read/exec/browser tools
+
+### Средний приоритет
+
+3. **Bridge Daemon** — не протестирован с qwen2.5:7b
+4. **Telegram bot** — нет токена
+5. **Gateway auth** — нужен persistent fix (сейчас через env var)
+
+### Низкий приоритет
+
+6. **Индексация Desktop субпапок** — Desktop/LOCAL NEUROEXPERT и CryptoExpertAgent обнаружены, но их можно добавить явно в SCAN_PATHS
+7. **Расписание переиндексации** — cron/Task Scheduler для index_files.py
 
 ---
 
 ## 🔧 Команды для старта
 
 ```powershell
-# Активация среды
+# Вариант 1: One-click startup
+.\start-gerald.ps1
+
+# Вариант 2: Ручной запуск
 & c:/Gerald-superBrain/.venv/Scripts/Activate.ps1
 $env:OLLAMA_API_KEY = "ollama-local"
-
-# Gateway (должен уже работать, pid 31104)
 openclaw gateway run
 
-# Тест Gerald
-openclaw agent --agent main --session-id test --message "Привет Gerald!"
+# В другом терминале:
+$env:OLLAMA_API_KEY = "ollama-local"
+openclaw agent --agent main --session-id my-session --message "Привет Gerald!"
 
-# Прямой тест Ollama (без OpenClaw)
-curl -s http://localhost:11434/api/generate -d '{"model":"qwen2.5:7b","prompt":"Привет!","stream":false}' | python -m json.tool
+# Переиндексация файлов (инкрементальная):
+python scripts/index_files.py
+
+# Полная переиндексация:
+python scripts/index_files.py --force
+
+# Поиск по индексу:
+python scripts/index_files.py --search "мой запрос" --results 5
 ```
 
 ---
 
-## 🧪 Подтверждённый рабочий вывод
-
-```
-Model: qwen2.5:7b
-Input: 13,248 tokens
-Output: 155 tokens
-stopReason: "stop"
-
-Response: "Привет! Я Геральд — персональный интеллектуальный ассистент,
-работающий внутри OpenClaw..."
-```
-
-_Checkpoint created: 2026-02-23T15:05 MSK_
+_Checkpoint updated: 2026-02-23T16:40 MSK_
