@@ -193,6 +193,7 @@ def scan_files(paths: list[str]) -> Generator[str, None, None]:
     for base_path in paths:
         base = Path(base_path)
         if not base.exists():
+            # print(f"  ⚠️ Skipping missing path: {base_path}")
             continue
 
         for root, dirs, files in os.walk(base):

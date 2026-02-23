@@ -18,18 +18,18 @@ def check_ollama():
             ["ollama", "list"], capture_output=True, text=True, timeout=10
         )
         models = result.stdout
-        has_qwen = "qwen2.5-coder:14b" in models
-        has_mistral = "mistral-nemo" in models
+        has_qwen = "qwen2.5:7b" in models or "qwen2.5-coder:14b" in models
+        has_mistral = "mistral:latest" in models
         
         if has_qwen and has_mistral:
-            print("✅ Ollama: qwen2.5-coder:14b + mistral-nemo available")
+            print("✅ Ollama: Primary (Qwen) + Fallback (Mistral) models available")
             return True
         else:
             missing = []
             if not has_qwen:
-                missing.append("qwen2.5-coder:14b")
+                missing.append("qwen2.5:7b")
             if not has_mistral:
-                missing.append("mistral-nemo:latest")
+                missing.append("mistral:latest")
             print(f"❌ Ollama: missing models: {', '.join(missing)}")
             return False
     except Exception as e:

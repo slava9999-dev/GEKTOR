@@ -3,6 +3,7 @@ Gerald-SuperBrain: Auto-Maintenance & Self-Healing
 Checks health, prunes logs, and ensures all services are optimal.
 """
 import os
+import sys
 import subprocess
 import json
 import time
