@@ -62,7 +62,7 @@ For EVERY non-trivial question or task:
 
 ## 📐 Context Window
 
-**~16,384 tokens (16k).** Prompt uses ~13k, leaving ~3k for conversation. Use RAG for anything beyond immediate context.
+**~32,768 tokens (32k).** System prompt uses ~10k, leaving **~22k for conversation.** Use RAG for anything beyond immediate context.
 
 ---
 

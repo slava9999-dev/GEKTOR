@@ -36,6 +36,9 @@ desktop.ini
 # Logs (keep structure, ignore content)
 *.log
 
+# Indexer state (generated)
+scripts/.index_state.json
+
 # Bridge temp files
 bridge/inbox/*.md
 bridge/outbox/*.md

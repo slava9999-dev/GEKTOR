@@ -58,35 +58,40 @@ def init_collections():
             {
                 "id": "gerald-identity",
                 "document": "Gerald is a personal JARVIS 2026 AI assistant owned by Вячеслав (Slava). "
-                           "Gerald runs on OpenClaw with Ollama local models. Primary model: qwen2.5-coder:14b "
-                           "(8k optimized context). Heavy model: mistral-nemo:latest (16k context). "
+                           "Gerald runs on OpenClaw with Ollama local models. Primary model: qwen2.5:7b "
+                           "(32k context, num_gpu=35). Fallbacks: mistral:latest (7B), qwen2.5-coder:14b (heavy code only). "
                            "Gerald uses advanced reasoning: CoT, ToT, self-critique, multi-step planning. "
-                           "Optimized for RTX 4070 8GB VRAM.",
+                           "Optimized for RTX 4070 8GB VRAM. RAM: 16GB.",
                 "metadata": {"source": "setup", "type": "identity", "tags": "gerald,identity,core"}
             },
             {
                 "id": "gerald-architecture", 
                 "document": "Gerald-SuperBrain architecture: OpenClaw agent framework → Ollama for local LLM inference → "
-                           "ChromaDB for vector memory (RAG). Skills: skill-master, vector-knowledge, model-manager, "
-                           "antigravity-bridge, self-improver, reasoning-engine. Active Bridge Daemon "
-                           "(bridge/bridge_daemon.py) ensures 24/7 connectivity with Antigravity UI.",
+                           "ChromaDB for vector memory (RAG). Collections: gerald-knowledge (core facts), "
+                           "gerald-files (26k+ chunks from 4200+ indexed files across all projects). "
+                           "Skills: skill-master, vector-knowledge, model-manager, "
+                           "antigravity-bridge, self-improver, reasoning-engine. "
+                           "Bridge Daemon (bridge/bridge_daemon.py) for Antigravity connectivity.",
                 "metadata": {"source": "setup", "type": "architecture", "tags": "architecture,skills,system"}
             },
             {
                 "id": "gerald-models",
-                "document": "Model fleet (RTX 4070 Optimized): 1) qwen2.5-coder:14b — primary. "
-                           "Params: num_ctx=8192, num_gpu=26, temp=0.65. "
-                           "2) mistral-nemo:latest — heavy. "
-                           "Params: num_ctx=16384, num_gpu=28, temp=0.55. "
-                           "Thermal limits: max 80°C GPU, auto-unload after 20min idle.",
+                "document": "Model fleet (RTX 4070, 8GB VRAM, 16GB RAM): "
+                           "1) qwen2.5:7b — PRIMARY. Russian + tool-calling. "
+                           "Params: num_ctx=32768, num_gpu=35, temp=0.7. "
+                           "2) mistral:latest (7B) — fallback, English only. num_ctx=8192. "
+                           "3) qwen2.5-coder:14b — heavy code ONLY (causes tool-loop as primary!). "
+                           "4) mistral-nemo (12B) — DO NOT LOAD (CUDA OOM). "
+                           "Thermal limit: 80C GPU, auto-unload 20min idle.",
                 "metadata": {"source": "setup", "type": "configuration", "tags": "models,ollama,thermal"}
             },
             {
                 "id": "owner-profile",
                 "document": "Owner: Вячеслав (Slava). Experienced developer working on: crypto trading systems "
-                           "(Red Citadel), Telegram bots, AI solutions, smart assistants, Web3/DeFi, marketplace "
-                           "integrations. Preferred stack: Python, TypeScript. Uses Bybit exchange. "
-                           "Has NVIDIA GeForce RTX 4070 Laptop GPU (8GB VRAM). OS: Windows.",
+                           "(Red Citadel V3.0 - Bybit perpetual futures), Telegram bots, AI solutions, smart assistants, "
+                           "Web3/DeFi, marketplace integrations, NeuroExpert platform, NeuroGUARDIAN. "
+                           "Preferred stack: Python, TypeScript. Uses Bybit exchange. "
+                           "Has NVIDIA GeForce RTX 4070 Laptop GPU (8GB VRAM), 16GB RAM. OS: Windows.",
                 "metadata": {"source": "setup", "type": "owner", "tags": "slava,owner,profile"}
             },
         ]
