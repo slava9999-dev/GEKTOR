@@ -5,21 +5,23 @@ import time
 import json
 import subprocess
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load security environment
+BASE_DIR = r"c:\Gerald-superBrain"
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # Configuration
-BASE_DIR = r"c:\Gerald-superBrain"
 BRIDGE_DIR = os.path.join(BASE_DIR, "bridge")
 INBOX = os.path.join(BRIDGE_DIR, "inbox")
 OUTBOX = os.path.join(BRIDGE_DIR, "outbox")
 STATUS_FILE = os.path.join(BRIDGE_DIR, "status.json")
-TG_CONFIG_PATH = os.path.join(BASE_DIR, "skills", "telegram-guard", "config.json")
 
 def get_tg_config():
-    try:
-        with open(TG_CONFIG_PATH, 'r') as f:
-            return json.load(f)
-    except:
-        return None
+    return {
+        "bot_token": os.getenv("TELEGRAM_BOT_TOKEN"),
+        "default_chat_id": int(os.getenv("TELEGRAM_CHAT_ID", 0))
+    }
 
 def update_status(inbox_count, outbox_count, status="running", error=None):
     try:
@@ -58,7 +60,7 @@ def check_telegram():
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     
     try:
-        resp = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10)
+        resp = requests.get(url, params={"offset": offset, "timeout": 3}, timeout=5)
         updates = resp.json().get("result", [])
         
         for update in updates:

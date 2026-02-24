@@ -4,12 +4,18 @@ import requests
 import json
 from datetime import datetime
 
-# Load config
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+from dotenv import load_dotenv
+
+# Load security environment
+BASE_DIR = r"c:\Gerald-superBrain"
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 def load_config():
-    with open(CONFIG_PATH, 'r') as f:
-        return json.load(f)
+    return {
+        "bot_token": os.getenv("TELEGRAM_BOT_TOKEN"),
+        "default_chat_id": int(os.getenv("TELEGRAM_CHAT_ID", 0)),
+        "alert_prefix": "🚨 GERALD: "
+    }
 
 def send_alert(message):
     config = load_config()

@@ -1,0 +1,29 @@
+system:
+  device: "cuda"
+  vram_limit_gb: 7.8
+  log_level: "INFO"
+  language: "ru"
+
+models:
+  primary:
+    path: "models/qwen2.5-7b-instruct-q4_k_m.gguf"
+    n_ctx: 32768
+    n_gpu_layers: 35
+    temperature: 0.7
+
+#  reranker:
+#    path: "models/bge-reranker-v2-m3-q4_k_m.gguf"
+
+memory:
+  vector_store_path: "memory/gerald_v2.lance"
+  embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  chunk_size: 1500
+  chunk_overlap: 200
+
+paths:
+  workspace: "gerald_workspace"
+  tmp_run: "gerald_workspace/tmp_run"
+  logs: "logs/gerald_sys.log"
+
+sandbox:
+  timeout: 15

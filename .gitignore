@@ -45,3 +45,8 @@ bridge/outbox/*.md
 !bridge/inbox/.gitkeep
 !bridge/outbox/.gitkeep
 !bridge/shared-context/.gitkeep
+
+# AI Assets & Memory
+models/
+memory/
+gerald_workspace/tmp_run/

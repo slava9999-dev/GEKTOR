@@ -58,8 +58,29 @@ def gpu_safety_check():
     except:
         return True
 
+def sync_identity():
+    """Sync canonical identity files to OpenClaw workspace."""
+    workspace_path = os.path.expanduser(r"~\.openclaw\workspace")
+    if not os.path.exists(workspace_path):
+        return
+    
+    files_to_sync = ["SOUL.md", "USER.md"]
+    for f in files_to_sync:
+        src = os.path.join(BASE_DIR, f)
+        dst = os.path.join(workspace_path, f)
+        if os.path.exists(src):
+            try:
+                import shutil
+                shutil.copy2(src, dst)
+                # print(f"🔄 Synced {f} to workspace")
+            except:
+                pass
+
 def main():
     print(f"[{datetime.now().isoformat()}] 🛠 Running Gerald Maintenance...")
+    
+    # 0. Sync
+    sync_identity()
     
     # 1. Self-Healing & Reflection
     check_docker_chroma()
