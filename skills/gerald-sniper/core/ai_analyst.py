@@ -46,8 +46,10 @@ class GeraldSniperAnalyst:
                     "supports_json_object": True,
                     "extra_body": {
                         "provider": {
-                            "order": ["OpenAI"]  # Bypass Azure jailbreak filters
-                        }
+                            "order": ["OpenAI"],
+                            "require": ["openai"],
+                        },
+                        "route": "fallback",
                     }
                 }
             },

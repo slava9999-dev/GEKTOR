@@ -50,8 +50,10 @@ class GeraldBridgeV2:
                     "supports_json_object": True,
                     "extra_body": {
                         "provider": {
-                            "order": ["OpenAI"]  # Bypass Azure filters
-                        }
+                            "order": ["OpenAI"],  # Bypass Azure filters
+                            "require": ["openai"],  # Hard requirement: only OpenAI backend
+                        },
+                        "route": "fallback",  # Force fallback routing (skips Azure primary)
                     },
                     "extra_headers": {
                         "HTTP-Referer": "https://gerald-superbrain.local",
