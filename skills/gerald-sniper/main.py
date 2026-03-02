@@ -27,6 +27,7 @@ from core.ai_analyst import analyst
 async def radar_loop(rest_client: BybitREST, ws_manager: BybitWSManager, db_manager: DatabaseManager, candle_mgr: CandleManager):
     """Periodically fetches all tickers, ranks them, and updates WS subscriptions."""
     scanner = RadarScanner(rest_client, db_manager, config)
+    _last_top3: list[str] = []  # Anti-spam: track top-3 to avoid duplicate AI insights
     
     while True:
         try:
@@ -50,11 +51,16 @@ async def radar_loop(rest_client: BybitREST, ws_manager: BybitWSManager, db_mana
                             hot_sector_coins.extend(s_coins)
                 candle_mgr.btc_ctx['hot_sector_coins'] = list(set(hot_sector_coins))
                 
-                # AI Market Analysis
-                insight = await analyst.analyze_hot_coins(top_results)
-                if insight:
-                    from utils.telegram_bot import send_telegram_alert
-                    asyncio.create_task(send_telegram_alert(insight))
+                # AI Market Analysis (only if top-3 changed to avoid spam)
+                current_top3 = [r["metrics"].symbol for r in top_results[:3]]
+                if current_top3 != _last_top3:
+                    _last_top3 = current_top3
+                    insight = await analyst.analyze_hot_coins(top_results)
+                    if insight:
+                        from utils.telegram_bot import send_telegram_alert
+                        asyncio.create_task(send_telegram_alert(insight))
+                else:
+                    logger.debug(f"AI Insight skipped: top-3 unchanged ({current_top3})")
                     
                 # Update WS
                 await ws_manager.update_subscriptions(top_symbols)
