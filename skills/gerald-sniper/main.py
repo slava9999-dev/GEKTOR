@@ -173,8 +173,40 @@ async def main():
 
     retry_task = asyncio.create_task(candle_mgr.retry_failed_alerts_loop())
 
+    async def db_cleanup_loop(db_mgr):
+        """Runs DB cleanup once per day at 04:00 MSK (config.storage.cleanup_hour)."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        
+        tz_str = config.timezone if hasattr(config, 'timezone') else 'Europe/Moscow'
+        tz = ZoneInfo(tz_str)
+        cleanup_hour = config.storage.cleanup_hour if hasattr(config.storage, 'cleanup_hour') else 4
+        
+        while True:
+            try:
+                from datetime import datetime as dt
+                now = dt.now(tz)
+                if now.hour == cleanup_hour and now.minute < 10:
+                    logger.info("🧹 Starting scheduled DB cleanup...")
+                    await db_mgr.cleanup_old_data(
+                        watchlist_keep_days=config.storage.candle_cache_max_days if hasattr(config.storage, 'candle_cache_max_days') else 30,
+                        candle_keep_days=config.storage.candle_cache_max_days if hasattr(config.storage, 'candle_cache_max_days') else 30,
+                        alert_keep_days=config.storage.alert_history_max_days if hasattr(config.storage, 'alert_history_max_days') else 365,
+                    )
+                    # Sleep 1 hour to avoid re-running in the same hour
+                    await asyncio.sleep(3600)
+                else:
+                    await asyncio.sleep(300)  # Check every 5 minutes
+            except Exception as e:
+                logger.error(f"DB cleanup error: {e}")
+                await asyncio.sleep(600)
+    
+    cleanup_task = asyncio.create_task(db_cleanup_loop(db_manager))
+
     try:
-        await asyncio.gather(ws_task, radar_task, btc_task, retry_task)
+        await asyncio.gather(ws_task, radar_task, btc_task, retry_task, cleanup_task)
     except asyncio.CancelledError:
         pass
     except KeyboardInterrupt:
