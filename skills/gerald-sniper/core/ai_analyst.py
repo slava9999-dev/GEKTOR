@@ -86,7 +86,15 @@ class GeraldSniperAnalyst:
                 task_type="simple"
             )
             
-            return f"<b>🤖 AI Market Insight ({result.sentiment}):</b>\n{result.summary}"
+            sentiment_emoji = "🟢" if result.sentiment == "bullish" else "🔴" if result.sentiment == "bearish" else "⚪"
+            
+            return (
+                f"{sentiment_emoji} <b>AI RADAR │ {result.sentiment.upper()}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{result.summary}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>Gerald AI 🧠</i>"
+            )
             
         except Exception as e:
             logger.error(f"AI Analyst error: {e}")

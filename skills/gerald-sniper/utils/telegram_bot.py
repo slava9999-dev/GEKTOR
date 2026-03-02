@@ -34,16 +34,18 @@ async def send_telegram_alert(message: str, parse_mode: str = "HTML", disable_no
         return False
 
 def format_level_alert(symbol: str, level: dict) -> str:
-    """Formats a beautiful Telegram message for a newly detected level."""
-    # emojis
+    """Formats a Telegram message for a newly detected level."""
     emoji = "🔴" if level['type'] == 'RESISTANCE' else "🟢"
+    level_type = "СОПРОТИВЛЕНИЕ" if level['type'] == 'RESISTANCE' else "ПОДДЕРЖКА"
     
-    msg = f"<b>{emoji} Gerald Sniper: Новый уровень!</b>\n"
-    msg += f"<b>Монета:</b> #{symbol}\n"
-    msg += f"<b>Уровень:</b> {level['price']} ({level['type']})\n"
-    msg += f"<b>Дистанция:</b> {level['distance_pct']}%\n"
-    msg += f"<b>Касаний:</b> {level['touches']} (Подд: {level['support_touches']}, Сопр: {level['resistance_touches']})\n"
-    msg += f"<b>Score (Сила):</b> {level['strength']}/100\n\n"
-    msg += f"<i>Взял на мушку. Жду триггер для входа... 🎯</i>"
-    
+    msg = (
+        f"{emoji} <b>LEVEL │ {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 <code>{level['price']}</code> │ {level_type}\n"
+        f"📏 Дистанция: {level['distance_pct']}%\n"
+        f"✋ Касаний: {level['touches']} (S:{level['support_touches']} R:{level['resistance_touches']})\n"
+        f"💪 Сила: {level['strength']}/100\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Gerald Sniper 🎯 │ На мушке</i>"
+    )
     return msg

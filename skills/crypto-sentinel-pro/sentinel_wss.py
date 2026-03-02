@@ -320,12 +320,26 @@ class WSSentinel:
     def trigger_whale_alert(
         self, symbol: str, side: str, price: float, usd_val: float
     ) -> None:
-        emoji_side = (
-            "🟩 ЖЕСТКИЙ ЗАКУП (Вдарили по Ask'ам)"
-            if side == "Buy"
-            else "🟥 КРАСНАЯ СОПЛЯ (Ударили по Bid'ам)"
+        if side == "Buy":
+            emoji = "🟩"
+            action = "АГРЕССИВНЫЙ ЗАКУП"
+            detail = "Маркет-бай по Ask'ам"
+        else:
+            emoji = "🟥"
+            action = "СБРОС В РЫНОК"
+            detail = "Маркет-селл по Bid'ам"
+
+        size_str = f"${usd_val/1e6:.2f}M" if usd_val >= 1_000_000 else f"${usd_val/1e3:.0f}K"
+
+        msg = (
+            f"{emoji} <b>КИТ │ {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 <b>{size_str}</b> │ {action}\n"
+            f"📍 Цена: <code>${price}</code>\n"
+            f"📋 {detail}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Gerald Sentinel 🔭</i>"
         )
-        msg = f"<b>🐋 КТО-ТО ЖИРНЫЙ ВЛЕТЕЛ В {symbol}</b>\nДвиж: {emoji_side}\nКотлета: <b>${usd_val/1e6:.2f}M</b>\nЗашел по: ${price}"
         logger.info(f"WHALE: {symbol} {side} ${usd_val:.0f} @ {price}")
         send_telegram_alert_async(msg, self.tg_config)
 
@@ -333,29 +347,65 @@ class WSSentinel:
         self, symbol: str, side: str, price: float, usd_val: float
     ) -> None:
         if side == "Buy":
-            rekt_type = "🩳 Шортистов несут вперед ногами (Short Squeeze)"
+            emoji = "🩳"
+            rekt_type = "SHORT SQUEEZE"
+            victim = "Шортисты"
         else:
-            rekt_type = "🩸 Лонгустов сбрили (Long Liquidation)"
+            emoji = "🩸"
+            rekt_type = "LONG LIQUIDATION"
+            victim = "Лонгисты"
 
-        msg = f"<b>💀 КЛАДБИЩЕ ЛИКВИДАЦИЙ: {symbol}</b>\nСуета: {rekt_type}\nРынок сожрал: <b>${usd_val/1e3:.0f}K</b>\nУбило об цену: ${price}"
+        size_str = f"${usd_val/1e6:.2f}M" if usd_val >= 1_000_000 else f"${usd_val/1e3:.0f}K"
+
+        msg = (
+            f"{emoji} <b>REKT │ {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💀 <b>{size_str}</b> │ {rekt_type}\n"
+            f"📍 Цена: <code>${price}</code>\n"
+            f"👥 {victim} ликвидированы\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Gerald Sentinel 🔭</i>"
+        )
         logger.info(f"REKT: {symbol} {rekt_type} ${usd_val:.0f} @ {price}")
         send_telegram_alert_async(msg, self.tg_config)
 
     def trigger_cvd_alert(self, symbol: str, cvd_val: float) -> None:
-        direction = (
-            "🚀 Пылесосят стакан вверх (CVD ПАМП)"
-            if cvd_val > 0
-            else "🩸 Дампят безжалостно (CVD ДАМП)"
+        if cvd_val > 0:
+            emoji = "🟢"
+            direction = "ПОКУПАТЕЛИ ДАВЯТ"
+        else:
+            emoji = "🔴"
+            direction = "ПРОДАВЦЫ ДАВЯТ"
+
+        msg = (
+            f"{emoji} <b>CVD │ {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>${cvd_val/1e6:+.2f}M</b> │ {direction}\n"
+            f"⏱ Окно: 5 минут\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Gerald Sentinel 🔭</i>"
         )
-        msg = f"<b>{direction}</b>\nПациент: <b>{symbol}</b>\nПеревес по маркету (5м): <b>${cvd_val/1e6:+.2f}M</b>"
         logger.info(f"CVD SPIKE: {symbol} {cvd_val:+.0f}")
         send_telegram_alert_async(msg, self.tg_config)
 
     def trigger_dom_alert(
         self, symbol: str, side: str, price: float, usd_val: float
     ) -> None:
-        emoji_side = "🟢 Вёдра на подбор" if "Bid" in side else "🔴 Стена лимиток"
-        msg = f"<b>🧱 БЕТОННАЯ ПЛИТА В СТАКАНЕ</b>\nАктив: <b>{symbol}</b>\nТип: {emoji_side} {side}\nРазмер завала: <b>${usd_val/1e6:.2f}M</b>\nНа уровне: ${price}"
+        if "Bid" in side:
+            emoji = "🟢"
+            wall_type = "СТЕНА ПОКУПОК"
+        else:
+            emoji = "🔴"
+            wall_type = "СТЕНА ПРОДАЖ"
+
+        msg = (
+            f"🧱 <b>DOM │ {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{emoji} <b>${usd_val/1e6:.2f}M</b> │ {wall_type}\n"
+            f"📍 Уровень: <code>${price}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Gerald Sentinel 🔭</i>"
+        )
         logger.info(f"DOM WALL: {symbol} {side} ${usd_val:.0f} @ {price}")
         send_telegram_alert_async(msg, self.tg_config)
 

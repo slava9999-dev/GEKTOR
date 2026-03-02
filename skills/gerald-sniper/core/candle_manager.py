@@ -469,39 +469,62 @@ class CandleManager:
         }
 
     def _format_trigger_alert(self, symbol: str, level: dict, trigger: dict, score: int, priority: str, risk_data: dict | None = None) -> str:
-        emoji = "🧨" if trigger['pattern'].startswith('COMP') else "🌊"
-        if trigger['pattern'].startswith('BREAKOUT'): emoji = "🚀"
-        
         direction = trigger.get('direction')
         if not direction:
             direction = "LONG" if level['type'] == 'RESISTANCE' else "SHORT"
-             
-        direction_text = "ЛОНГ 📈" if direction == 'LONG' else "ШОРТ 📉"
-        
-        header = "🔥 СИГНАЛ: GERALD SNIPER 🔥"
-        if priority == "critical": header = "🚨 КРИТИЧЕСКИЙ СИГНАЛ 🚨"
-        elif priority == "normal": header = "ℹ️ ФОРМИРУЕТСЯ СЕТАП ℹ️"
         
         # Use pre-calculated risk_data if provided, otherwise calculate
         if risk_data is None:
             risk_data = self._calculate_stop_and_target(symbol, level, direction)
+
+        # Priority-based header design
+        if priority == "critical":
+            header = "🚨 CRITICAL SIGNAL"
+            score_bar = "🟢" * min(score // 10, 10)
+        elif priority == "important":
+            header = "🔥 SNIPER ALERT"
+            score_bar = "🟡" * min(score // 10, 10)
+        else:
+            header = "📋 SETUP FORMING"
+            score_bar = "⚪" * min(score // 10, 10)
         
-        msg = f"<b>{emoji} {header} {score}/100</b>\n\n"
-        msg += f"<b>Монета:</b> #{symbol}\n"
-        msg += f"<b>Модель:</b> {trigger['pattern']}\n"
-        msg += f"<b>Описание:</b> {trigger['description']}\n\n"
-        msg += f"<b>Уровень:</b> {level['price']}\n"
-        msg += f"<b>Направление:</b> {direction_text}\n\n"
+        # Pattern emoji
+        if trigger['pattern'].startswith('COMP'):
+            pattern_emoji = "🧨"
+        elif trigger['pattern'].startswith('BREAKOUT'):
+            pattern_emoji = "🚀"
+        elif trigger['pattern'].startswith('VOL'):
+            pattern_emoji = "🌊"
+        else:
+            pattern_emoji = "⚡"
+            
+        dir_emoji = "📈" if direction == 'LONG' else "📉"
+        dir_text = "ЛОНГ" if direction == 'LONG' else "ШОРТ"
+        
+        msg = (
+            f"<b>{header} │ {score}/100</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{dir_emoji} <b>{symbol}</b> │ {dir_text}\n"
+            f"{pattern_emoji} {trigger['pattern']}\n"
+            f"📝 {trigger['description']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Уровень: <code>{level['price']}</code>\n"
+        )
         
         if risk_data['calculable']:
-            msg += f"<b>Стоп:</b> {risk_data['stop_price']} ({risk_data['stop_pct']}%)\n"
-            msg += f"<b>Цель:</b> {risk_data['target_price']} (R:R 1:{risk_data['rr_ratio']})\n"
+            msg += (
+                f"🛑 Стоп: <code>{risk_data['stop_price']}</code> ({risk_data['stop_pct']}%)\n"
+                f"🎯 Цель: <code>{risk_data['target_price']}</code> (R:R 1:{risk_data['rr_ratio']})\n"
+            )
             
             sizing_enabled = getattr(config.risk, 'position_sizing_enabled', False) if hasattr(config, 'risk') else False
             if sizing_enabled:
-                risk_per_trade_usd = getattr(config.risk, 'risk_per_trade_usd', 20.0) if hasattr(config, 'risk') else 20.0
-                msg += f"<b>Размер:</b> ~${risk_data['position_size']:.0f} "
-                msg += f"(риск ${risk_per_trade_usd})\n"
+                risk_usd = getattr(config.risk, 'risk_per_trade_usd', 20.0) if hasattr(config, 'risk') else 20.0
+                msg += f"💰 Размер: ~${risk_data['position_size']:.0f} (риск ${risk_usd})\n"
         
-        msg += f"\n<i>Gerald Sniper 🤖 | NFA</i>"
+        msg += (
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{score_bar}\n"
+            f"<i>Gerald Sniper 🎯 │ NFA</i>"
+        )
         return msg
