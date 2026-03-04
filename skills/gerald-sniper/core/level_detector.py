@@ -1,0 +1,384 @@
+import numpy as np
+import math
+from scipy.signal import argrelextrema, find_peaks
+from scipy.stats import gaussian_kde
+from loguru import logger
+from typing import List, Dict
+
+
+def _get_adaptive_params(atr_pct: float, current_price: float, config: dict) -> dict:
+    """
+    Адаптирует параметры уровней под волатильность монеты.
+    Чем выше ATR — тем шире допуск.
+    
+    Логика:
+    - min_touches = 2 (двойная вершина/дно — это уже уровень)
+    - touch_tolerance = 25% от среднего размера свечи (ATR), 
+      с ограничением от 0.4% до 2.0%.
+    - max_distance = расширяется на высоковолатильных монетах.
+    """
+    base_touches = config.get('min_touches', 2)
+    base_distance = config.get('max_distance_pct', 5.0)
+
+    # Допуск касания составляет 25% от средней дневной свечи (ATR H1)
+    # Мин. 0.4%, макс. 2.0%
+    dynamic_tolerance = max(0.004, min(0.020, (atr_pct / 100.0) * 0.25))
+
+    distance_multiplier = 1.5 if atr_pct > 5.0 else 1.0
+
+    return {
+        'min_touches': base_touches,
+        'touch_tolerance_pct': dynamic_tolerance,
+        'max_distance_pct': base_distance * distance_multiplier,
+    }
+
+
+def detect_levels(
+    candles_h1: List[Dict],      # Minimum 20 candles H1
+    current_price: float,
+    config: Dict
+) -> List[Dict]:
+    """
+    KDE-уровни: кластеризация свинг-экстремумов.
+    Использует адаптивные параметры в зависимости от ATR монеты.
+    """
+    if len(candles_h1) < 20:
+        return []
+
+    highs = np.array([float(c['high']) for c in candles_h1])
+    lows = np.array([float(c['low']) for c in candles_h1])
+
+    # Расчёт ATR% для адаптивной логики
+    atr = np.mean([abs(h - l) for h, l in zip(highs, lows)])
+    atr_pct = (atr / current_price) * 100 if current_price > 0 else 1.0
+
+    # Адаптивные параметры на основе волатильности
+    adaptive = _get_adaptive_params(atr_pct, current_price, config)
+    min_touches = adaptive['min_touches']
+    dynamic_tolerance = adaptive['touch_tolerance_pct']
+    max_distance_pct = adaptive['max_distance_pct']
+
+    logger.info(
+        f"📐 Adaptive: price={current_price:.4f}, ATR={atr_pct:.1f}%: "
+        f"touches={min_touches}, tolerance={dynamic_tolerance*100:.1f}%, "
+        f"max_dist={max_distance_pct:.1f}%, extremes={len(all_extremes) if 'all_extremes' in dir() else '?'}"
+    )
+
+    # STEP 1: Свинг-экстремумы
+    swing_order = config.get('swing_order', 5)
+
+    if len(highs) <= swing_order * 2:
+        return []
+
+    swing_high_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
+    swing_low_idx = argrelextrema(lows, np.less, order=swing_order)[0]
+
+    swing_highs = highs[swing_high_idx]
+    swing_lows = lows[swing_low_idx]
+
+    all_extremes = np.concatenate([swing_highs, swing_lows])
+    
+    if len(all_extremes) < 3:
+        logger.debug(f"KDE skipped: only {len(all_extremes)} extremes found (need 3+)")
+        return []
+
+    # STEP 2: KDE кластеризация
+    price_range_width = all_extremes.max() - all_extremes.min()
+    if price_range_width == 0:
+        return []
+
+    # Адаптивная KDE bandwidth
+    if config.get('kde_bandwidth_adaptive', True):
+        target_pct = (atr_pct / 100) * 1.5
+        target_pct = max(
+            config.get('kde_bandwidth_min', 0.008),
+            min(config.get('kde_bandwidth_max', 0.025), target_pct)
+        )
+    else:
+        target_pct = config.get('kde_bandwidth', 0.015)
+
+    data_std = np.std(all_extremes)
+    if data_std == 0:
+        bw = 0.1
+    else:
+        data_mean = np.mean(all_extremes)
+        desired_bandwidth = data_mean * target_pct
+        n_ext = len(all_extremes)
+        scott_factor = n_ext ** (-1.0 / 5.0)
+        bw_computed = desired_bandwidth / (scott_factor * data_std)
+        bw = max(0.01, float(bw_computed))
+
+    try:
+        kde = gaussian_kde(all_extremes, bw_method=bw)
+    except np.linalg.LinAlgError as e:
+        logger.warning(f"KDE failed (singular matrix): {e}")
+        return []
+
+    grid = np.linspace(
+        all_extremes.min() - price_range_width * 0.05,
+        all_extremes.max() + price_range_width * 0.05,
+        2000
+    )
+    density = kde(grid)
+
+    # STEP 3: Пики плотности = ценовые уровни
+    peaks_idx, properties = find_peaks(density, height=np.max(density) * 0.15)
+    candidate_levels = grid[peaks_idx]
+
+
+    freshness_enabled = config.get('freshness_enabled', True)
+    freshness_decay_hours = config.get('freshness_decay_hours', 72)
+    freshness_penalty_pct = config.get('freshness_penalty_pct', 20)
+
+    total_candles = len(candles_h1)
+
+    levels = []
+    for level_price in candidate_levels:
+        # Инициализация в начале каждой итерации (Задача #11)
+        hours_ago = 0
+        is_stale = False
+        touch_indices = []
+
+        # Зона касания = max(0.3%, 45% от ширины KDE)
+        bw_pct = bw / current_price if current_price > 0 else 0
+        zone_tolerance = max(dynamic_tolerance, bw_pct * 0.45)
+
+        zone_low = level_price * (1 - zone_tolerance)
+        zone_high = level_price * (1 + zone_tolerance)
+
+        # Какие экстремумы коснулись этого уровня
+        res_mask = (swing_highs >= zone_low) & (swing_highs <= zone_high)
+        sup_mask = (swing_lows >= zone_low) & (swing_lows <= zone_high)
+
+        res_touches = int(np.sum(res_mask))
+        sup_touches = int(np.sum(sup_mask))
+        total_touches = res_touches + sup_touches
+
+        if total_touches < min_touches:
+            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches < {min_touches} required")
+            continue
+
+        level_type = 'RESISTANCE' if level_price > current_price else 'SUPPORT'
+        distance_pct = abs(level_price - current_price) / current_price * 100
+
+        # Высококачественные уровни видны издалека
+        effective_max_dist = max_distance_pct
+        if total_touches >= 10:
+            effective_max_dist *= 2.5
+        elif total_touches >= 5:
+            effective_max_dist *= 1.5
+            
+        if distance_pct > effective_max_dist:
+            continue
+
+        # Базовая сила (log шкала — дифференцирует 6 vs 15 vs 24 касания)
+        touches_mult = min(math.log2(total_touches + 1) / math.log2(30), 1.0)
+        strength = touches_mult * 70.0 + max(0, 30 - distance_pct * 10)
+
+        # Проверка свежести
+        if freshness_enabled:
+            touch_indices = []
+            if res_touches > 0:
+                touch_indices.extend(swing_high_idx[res_mask].tolist())
+            if sup_touches > 0:
+                touch_indices.extend(swing_low_idx[sup_mask].tolist())
+
+            if touch_indices:
+                last_touch_idx = max(touch_indices)
+                hours_ago = total_candles - 1 - last_touch_idx
+                is_stale = hours_ago > freshness_decay_hours
+                if is_stale:
+                    strength -= (strength * (freshness_penalty_pct / 100.0))
+
+        strength = min(100.0, max(0.0, strength))
+
+        levels.append({
+            'price': round(float(level_price), 8),
+            'type': level_type,
+            'touches': total_touches,
+            'resistance_touches': res_touches,
+            'support_touches': sup_touches,
+            'distance_pct': round(float(distance_pct), 2),
+            'strength': round(float(strength), 1),
+            'stale': is_stale,
+            'source': 'KDE',
+            'hours_since_touch': hours_ago,
+        })
+
+    levels.sort(key=lambda x: (-x['strength'], x['distance_pct']))
+
+    max_levels = config.get('max_levels_per_coin', 6)
+    return levels[:max_levels]
+
+
+def detect_dynamic_levels(
+    candles_h1: List[Dict],
+    current_price: float,
+    config: Dict
+) -> List[Dict]:
+    """
+    Динамические уровни, не зависящие от кластеризации касаний:
+    - Недельный максимум/минимум
+    - Круглые числа (психологические уровни)
+    
+    Критичны для импульсных монет, где KDE-уровни не формируются
+    из-за хаотичных свингов.
+    """
+    if not candles_h1 or current_price <= 0:
+        return []
+
+    if not config.get('enable_dynamic_levels', True):
+        return []
+
+    levels = []
+    max_distance_pct = config.get('max_distance_pct', 4.0)
+    dynamic_max_strength = config.get('dynamic_level_max_strength', 75)
+
+    highs = [float(c['high']) for c in candles_h1]
+    lows = [float(c['low']) for c in candles_h1]
+
+    # === 1. Недельный максимум и минимум ===
+    week_high = max(highs)
+    week_low = min(lows)
+
+    # Для WEEK_EXTREME — свой distance filter:
+    week_max_distance = max_distance_pct * 2.0  # 8% вместо 4%
+
+    logger.debug(
+        f"WEEK_EXTREME check: price={current_price:.6f}, "
+        f"week_high={week_high:.6f} (dist={abs(week_high-current_price)/current_price*100:.1f}%), "
+        f"week_low={week_low:.6f} (dist={abs(week_low-current_price)/current_price*100:.1f}%)"
+    )
+
+    for price, ltype in [(week_high, 'RESISTANCE'), (week_low, 'SUPPORT')]:
+        dist_pct = abs(price - current_price) / current_price * 100
+        if 0.3 < dist_pct < week_max_distance:
+            levels.append({
+                'price': round(float(price), 8),
+                'type': ltype,
+                'touches': 1,
+                'resistance_touches': 1 if ltype == 'RESISTANCE' else 0,
+                'support_touches': 1 if ltype == 'SUPPORT' else 0,
+                'distance_pct': round(dist_pct, 2),
+                'strength': 50.0,
+                'stale': False,
+                'source': 'WEEK_EXTREME',
+                'hours_since_touch': 0,
+            })
+
+    # === 2. Круглые числа (психологические уровни) ===
+    if current_price > 10000:
+        steps = [1000, 500, 250]
+    elif current_price > 1000:
+        steps = [100, 50, 25]
+    elif current_price > 100:
+        steps = [10, 5, 2.5]
+    elif current_price > 10:
+        steps = [1, 0.5, 0.25]
+    elif current_price > 1:
+        steps = [0.1, 0.05, 0.025]
+    elif current_price > 0.01:
+        steps = [0.01, 0.005, 0.0025]
+    elif current_price > 0.001:
+        steps = [0.001, 0.0005, 0.00025]
+    else:
+        steps = [0.0001, 0.00005, 0.000025]
+
+    for step in steps:
+        above = (int(current_price / step) + 1) * step
+        below = int(current_price / step) * step
+
+        for rn, ltype in [(above, 'RESISTANCE'), (below, 'SUPPORT')]:
+            dist_pct = abs(rn - current_price) / current_price * 100
+            
+            # Проверяем: был ли разворот у этого круглого числа?
+            touch_count = 0
+            tolerance = rn * 0.003  # 0.3% зона
+            for h, l in zip(highs, lows):
+                if abs(h - rn) < tolerance or abs(l - rn) < tolerance:
+                    touch_count += 1
+                    
+            effective_max_dist = max_distance_pct
+            if touch_count >= 10:
+                effective_max_dist *= 2.5
+            elif touch_count >= 5:
+                effective_max_dist *= 1.5
+
+            if 0.1 < dist_pct < effective_max_dist:
+
+                # Continuous scoring: base + touches + proximity bonus
+                proximity_bonus = max(0, 10 - dist_pct * 3)  # closer = better
+                strength = 30.0 + (touch_count * 6) + proximity_bonus
+                strength = min(float(dynamic_max_strength), strength)
+
+                levels.append({
+                    'price': round(float(rn), 8),
+                    'type': ltype,
+                    'touches': touch_count,
+                    'resistance_touches': touch_count if ltype == 'RESISTANCE' else 0,
+                    'support_touches': touch_count if ltype == 'SUPPORT' else 0,
+                    'distance_pct': round(dist_pct, 2),
+                    'strength': round(strength, 1),
+                    'stale': False,
+                    'source': 'ROUND_NUMBER',
+                    'hours_since_touch': 0,
+                })
+
+    # Дедупликация: если два уровня ближе 0.3% — оставить сильнейший
+    levels.sort(key=lambda x: x['price'])
+    deduped = []
+    for lvl in levels:
+        if deduped and lvl['price'] > 0 and abs(lvl['price'] - deduped[-1]['price']) / lvl['price'] < 0.003:
+            if lvl['strength'] > deduped[-1]['strength']:
+                deduped[-1] = lvl
+        else:
+            deduped.append(lvl)
+
+    return deduped
+
+
+def detect_all_levels(
+    candles_h1: List[Dict],
+    current_price: float,
+    config: Dict
+) -> List[Dict]:
+    """
+    Главная функция: объединяет KDE (структурные) и динамические уровни.
+    Вызывается из main.py вместо detect_levels.
+    """
+    # KDE-уровни (существующая логика с адаптивными порогами)
+    kde_levels = detect_levels(candles_h1, current_price, config)
+
+    # Динамические уровни (новое)
+    dyn_levels = detect_dynamic_levels(candles_h1, current_price, config)
+
+    logger.info(
+        f"📐 KDE: {len(kde_levels)} levels, Dynamic: {len(dyn_levels)} levels "
+        f"(candles={len(candles_h1)}, price={current_price:.4f})"
+    )
+
+    # Объединение с дедупликацией
+    final = list(kde_levels)  # Начинаем с копии KDE
+
+    for dyn in dyn_levels:
+        is_duplicate = False
+        for kde in final:
+            if kde['price'] > 0 and abs(dyn['price'] - kde['price']) / kde['price'] < 0.005:
+                # Совпадение — бонус к KDE уровню за подтверждение
+                kde['strength'] = min(100.0, kde['strength'] + 10)
+                kde['source'] = kde.get('source', 'KDE') + '+' + dyn.get('source', 'DYN')
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            final.append(dyn)
+
+    # Сортировка: сильнейшие и ближайшие первые
+    final.sort(key=lambda x: (-x['strength'], x['distance_pct']))
+
+    max_levels = config.get('max_levels_per_coin', 6)
+
+    if final:
+        sources = [lvl.get('source', '?') for lvl in final[:max_levels]]
+        logger.debug(f"Levels found: {len(final)} total, sources: {sources}")
+
+    return final[:max_levels]

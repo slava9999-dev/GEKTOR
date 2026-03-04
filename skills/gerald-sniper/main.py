@@ -20,7 +20,7 @@ from data.database import DatabaseManager
 from utils.config import config
 
 from core.radar import RadarScanner
-from core.level_detector import detect_levels
+from core.level_detector import detect_all_levels
 from core.candle_manager import CandleManager
 from core.ai_analyst import analyst
 
@@ -31,6 +31,11 @@ async def radar_loop(rest_client: BybitREST, ws_manager: BybitWSManager, db_mana
     
     while True:
         try:
+            if not rest_client.is_healthy:
+                logger.info("⏸️ Radar scan skipped — API circuit breaker open. Waiting for recovery...")
+                await asyncio.sleep(config.radar.interval_minutes * 60)
+                continue
+            
             logger.info("📡 Executing Radar Scan...")
             top_results = await scanner.scan()
             
@@ -85,6 +90,8 @@ async def radar_loop(rest_client: BybitREST, ws_manager: BybitWSManager, db_mana
             
         await asyncio.sleep(config.radar.interval_minutes * 60)
 
+_last_logged_levels = {}
+
 async def run_levels_for_watchlist(rest: BybitREST, radar_results: list[dict], db: DatabaseManager, candle_mgr: CandleManager):
     """Calculates KDE levels for the current watchlist using H1 klines (168 candles)."""
     logger.info("🔍 Calculating mathematical levels for the watchlist...")
@@ -92,8 +99,12 @@ async def run_levels_for_watchlist(rest: BybitREST, radar_results: list[dict], d
     symbols = [r["metrics"].symbol for r in radar_results]
     radar_map = {r["metrics"].symbol: r["metrics"] for r in radar_results}
     
-    for symbol in symbols:
+    for i, symbol in enumerate(symbols):
         try:
+            # Staggered start to avoid immediate rate limit strikes on the first run
+            if i > 0 and i % 5 == 0:
+                await asyncio.sleep(0.5)
+
             klines = await rest.get_klines(symbol, "60", limit=config.levels.candles_lookback)
             if len(klines) < 50:
                 continue
@@ -120,18 +131,32 @@ async def run_levels_for_watchlist(rest: BybitREST, radar_results: list[dict], d
             else:
                 level_cfg = config.levels.__dict__
                 
-            levels = detect_levels(formatted_klines, current_price, level_cfg)
+            levels = detect_all_levels(formatted_klines, current_price, level_cfg)
+            
+            # --- FILTER ---
+            # Remove weak levels and limit to top 2 per coin to prevent trigger spam
+            levels = [l for l in levels if l['strength'] >= 50]
+            levels = sorted(levels, key=lambda x: -x['strength'])[:2]
             
             if levels:
                 levels_found += len(levels)
-                # Log top level for the coin
                 top_level = levels[0]
-                logger.info(f"🎯 {symbol} Level Found: {top_level['type']} @ {top_level['price']} (Score: {top_level['strength']})")
                 
-                # Send to Telegram
-                from utils.telegram_bot import send_telegram_alert, format_level_alert
-                msg = format_level_alert(symbol, top_level)
-                asyncio.create_task(send_telegram_alert(msg, disable_notification=True))
+                # Log top level for the coin (NO Telegram spam — triggers will send alerts)
+                level_key = f"{symbol}_{round(top_level['price'], 6)}"
+                last_score = _last_logged_levels.get(level_key, 0)
+                current_score = top_level['strength']
+                
+                if current_score >= 40:
+                    if abs(current_score - last_score) >= 5:
+                        logger.info(
+                            f"🎯 {symbol} Level: {top_level['type']} @ {top_level['price']} "
+                            f"(Score: {top_level['strength']}, Source: {top_level.get('source', 'KDE')}, "
+                            f"Touches: {top_level['touches']})"
+                        )
+                        _last_logged_levels[level_key] = current_score
+                else:
+                    logger.debug(f"Weak level skipped in logs: {symbol} @ {top_level['price']} (Score: {current_score})")
                 
                 # Wire levels to our real-time CandleManager for triggering!
                 candle_mgr.update_levels(symbol, levels, radar_metrics=radar_map.get(symbol))
@@ -147,7 +172,11 @@ async def run_levels_for_watchlist(rest: BybitREST, radar_results: list[dict], d
     logger.info(f"✅ Level calculation complete. Total {levels_found} actionable levels found.")
 
 async def main():
-    logger.add("logs/sniper.log", rotation="10 MB", retention="7 days", level="INFO")
+    from utils.log_filter import SensitiveFilter
+    log_filter = SensitiveFilter()
+    logger.remove()  # Убираем дефолтный handler
+    logger.add(sys.stderr, filter=log_filter, level="INFO")
+    logger.add("logs/sniper.log", filter=log_filter, rotation="10 MB", retention="14 days", level="INFO")
     logger.info("🚀 Gerald Sniper STARTING - SPRINT 1")
 
     # DB Match to config
@@ -155,7 +184,13 @@ async def main():
     db_manager = DatabaseManager(db_path)
     await db_manager.initialize()
 
-    rest_client = BybitREST(base_url=config.bybit.rest_url)
+    rest_client = BybitREST(
+        base_url=config.bybit.rest_url,
+        fallback_url=config.bybit.rest_url_fallback,
+    )
+    # Ручная установка параметров, так как __init__ не принимает их
+    rest_client._fallback_switch_threshold = getattr(config.bybit, 'fallback_switch_after_failures', 3)
+    rest_client._primary_recheck_interval = getattr(config.bybit, 'fallback_primary_recheck_sec', 600)
     ws_manager = BybitWSManager(ws_url=config.bybit.ws_url, ws_url_fallback=config.bybit.ws_url_fallback)
 
     # Hook WS data to CandleManager
@@ -163,8 +198,11 @@ async def main():
     
     async def btc_context_loop(candle_manager):
         while True:
-            await candle_manager.update_btc_context()
-            await asyncio.sleep(300)  # Каждые 5 минут
+            if rest_client.is_healthy:
+                await candle_manager.update_btc_context()
+            else:
+                logger.debug("⏸️ BTC context update skipped — API circuit breaker open")
+            await asyncio.sleep(300)  # Every 5 minutes
             
     async def process_ws(data):
         if "topic" in data and data["topic"].startswith("kline"):

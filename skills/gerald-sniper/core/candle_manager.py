@@ -224,6 +224,14 @@ class CandleManager:
 
         now = time.time()
         
+        # Diagnostic log (DEBUG level — won't show in production INFO logs)
+        logger.debug(
+            f"🔎 Checking triggers for {symbol}: "
+            f"{len(sym_data['levels'])} levels, "
+            f"M5: {len(sym_data.get('m5', []))}, "
+            f"M15: {len(sym_data.get('m15', []))}"
+        )
+        
         if hasattr(config.triggers, 'model_dump'):
             cfg = config.triggers.model_dump()
         elif hasattr(config.triggers, 'dict'):
@@ -256,11 +264,20 @@ class CandleManager:
                     t_break['type'] = 'breakout'
                     triggers_found.append(t_break)
                     
-                t_vol = td.detect_volume_spike_at_level(sym_data['m5'], level, cfg.get('volume_spike', {}))
+                t_vol = td.detect_volume_explosion(sym_data['m5'], level, cfg.get('volume_explosion', cfg.get('volume_spike', {})))
                 if t_vol:
                     t_vol['type'] = 'volume'
                     triggers_found.append(t_vol)
                     
+            if len(sym_data['m15']) >= 25:
+                # BB Squeeze Fire — THE signal for large move starts
+                sqz_cfg = cfg.get('squeeze', {})
+                if sqz_cfg.get('enabled', True):
+                    t_sqz = td.detect_squeeze_fire(sym_data['m15'], level, sqz_cfg)
+                    if t_sqz:
+                        t_sqz['type'] = 'squeeze'
+                        triggers_found.append(t_sqz)
+
             if len(sym_data['m15']) >= 20:
                 t_comp = td.detect_compression(sym_data['m15'], level, cfg.get('compression', {}))
                 if t_comp:
@@ -297,8 +314,21 @@ class CandleManager:
                     logger.info(f"🚫 MACRO BLOCK: Skipping SHORT on {symbol} due to BTC pumping {btc_change_4h}%")
                     continue
                     
-            last_ts = sym_data['last_alert'].get(level_id, 0)
-            if now - last_ts > cooldown_seconds:
+            # Anti-spam: check if any level within 0.5% was alerted recently (handles KDE level drift)
+            on_cooldown = False
+            for alerted_level_id, last_ts in sym_data['last_alert'].items():
+                parts = alerted_level_id.split('_')
+                if len(parts) >= 2:
+                    try:
+                        alerted_price = float(parts[1])
+                        if abs(alerted_price - level['price']) / (level['price'] or 1.0) < 0.005:
+                            if now - last_ts <= cooldown_seconds:
+                                on_cooldown = True
+                                break
+                    except ValueError:
+                        pass
+            
+            if not on_cooldown:
                 
                 # Calculate final score
                 score = 0
@@ -489,12 +519,14 @@ class CandleManager:
             score_bar = "⚪" * min(score // 10, 10)
         
         # Pattern emoji
-        if trigger['pattern'].startswith('COMP'):
+        if trigger['pattern'].startswith('SQUEEZE'):
+            pattern_emoji = "🔥"
+        elif trigger['pattern'].startswith('COMP'):
             pattern_emoji = "🧨"
         elif trigger['pattern'].startswith('BREAKOUT'):
             pattern_emoji = "🚀"
         elif trigger['pattern'].startswith('VOL'):
-            pattern_emoji = "🌊"
+            pattern_emoji = "💥"
         else:
             pattern_emoji = "⚡"
             
