@@ -299,11 +299,26 @@ async def main():
 
     weekly_report_task = asyncio.create_task(weekly_report_loop(db_manager))
 
-    # Initialize Telegram Oracle
-    tg_oracle = TelegramOracle(db=db_manager)
-    oracle_task = asyncio.create_task(tg_oracle.start())
+    # Initialize Telegram Oracle (only if sniper has its OWN bot token)
+    # If SNIPER_BOT_TOKEN == GERALD_BOT_TOKEN, bridge_v2 is already polling
+    # and will handle /win, /loss, /stats commands directly.
+    sniper_token = os.getenv("SNIPER_BOT_TOKEN", "")
+    gerald_token = os.getenv("GERALD_BOT_TOKEN", "")
+    
+    oracle_task = None
+    if sniper_token and sniper_token != gerald_token:
+        tg_oracle = TelegramOracle(db=db_manager)
+        oracle_task = asyncio.create_task(tg_oracle.start())
+    else:
+        logger.info(
+            "📡 Telegram Oracle SKIPPED: same token as bridge_v2. "
+            "Commands (/win, /loss, /stats) are handled by bridge_v2."
+        )
+        tg_oracle = None
 
-    tasks = [ws_task, radar_task, btc_task, retry_task, cleanup_task, weekly_report_task, oracle_task]
+    tasks = [ws_task, radar_task, btc_task, retry_task, cleanup_task, weekly_report_task]
+    if oracle_task:
+        tasks.append(oracle_task)
     try:
         await asyncio.gather(*tasks)
     except (asyncio.CancelledError, KeyboardInterrupt):
@@ -313,7 +328,11 @@ async def main():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await tg_oracle.stop()
+        if tg_oracle is not None:
+            try:
+                await tg_oracle.stop()
+            except Exception:
+                pass  # Oracle may not have started polling
         await ws_manager.disconnect()
         await rest_client.close()
         logger.info("✅ Shutdown complete.")

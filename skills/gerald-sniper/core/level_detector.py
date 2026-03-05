@@ -88,12 +88,11 @@ def detect_levels(
         logger.debug(f"KDE skipped: only {len(all_extremes)} extremes found (need 3+)")
         return []
 
-    # Adaptive max_touches cap: scales with total extremes count.
-    # With 168 H1 candles we get ~16-26 extremes. A hardcoded cap of 12 kills
-    # ALL KDE levels because a true structural level will naturally attract
-    # most extremes. Cap = 80% of total extremes — only rejects if literally
-    # ALL extremes sit on one price (= flat/dead coin, not a tradeable level).
-    max_touches_cap = max(12, int(len(all_extremes) * 0.8))
+    # Chop-zone detection: instead of hard-rejecting high-touch levels,
+    # we apply a progressive strength penalty. A level that attracts 60%+ of
+    # all extremes is likely noise, but could also be a genuinely important
+    # consolidation zone. Penalty scales from 0% to 50% of strength.
+    total_extremes_count = len(all_extremes)
 
     # STEP 2: KDE кластеризация
     price_range_width = all_extremes.max() - all_extremes.min()
@@ -170,10 +169,16 @@ def detect_levels(
         if total_touches < min_touches:
             logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches < {min_touches} required")
             continue
-            
-        if total_touches > max_touches_cap:
-            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches > {max_touches_cap} (likely a static chop zone, not a clean level)")
+
+        # Chop-zone progressive penalty instead of hard rejection
+        touch_ratio = total_touches / total_extremes_count if total_extremes_count > 0 else 0
+        chop_penalty = 0.0
+        if touch_ratio > 0.95:  # >95% of ALL extremes on one level = truly flat coin
+            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches}/{total_extremes_count} touches ({touch_ratio:.0%}) = flat/dead zone")
             continue
+        elif touch_ratio > 0.6:  # >60% = likely chop zone, heavy penalty
+            chop_penalty = min(0.5, (touch_ratio - 0.6) / 0.35 * 0.5)  # 0% → 50% penalty
+            logger.debug(f"KDE level {level_price:.6f}: chop penalty {chop_penalty:.0%} (touch_ratio={touch_ratio:.0%})")
 
         level_type = 'RESISTANCE' if level_price > current_price else 'SUPPORT'
         distance_pct = abs(level_price - current_price) / current_price * 100
@@ -191,6 +196,10 @@ def detect_levels(
         # Базовая сила (log шкала — дифференцирует 6 vs 15 vs 24 касания)
         touches_mult = min(math.log2(total_touches + 1) / math.log2(30), 1.0)
         strength = touches_mult * 70.0 + max(0, 30 - distance_pct * 10)
+        
+        # Apply chop penalty
+        if chop_penalty > 0:
+            strength *= (1.0 - chop_penalty)
 
         # Проверка свежести
         if freshness_enabled:
