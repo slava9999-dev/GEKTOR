@@ -1,4 +1,5 @@
 import asyncio
+import json
 from loguru import logger
 import time
 import datetime
@@ -9,43 +10,73 @@ from core.radar import CoinRadarMetrics
 from utils.config import config
 from utils.telegram_bot import send_telegram_alert
 from core.scoring import calculate_final_score
+from core.risk import calculate_stop_and_target
+from utils.safe_math import safe_float
 
 # No dummy GLOBAL_BTC_CTX needed as it's tracked in CandleManager
 
 class CandleManager:
     """Manages real-time candles and triggers for active watchlist."""
     
-    def __init__(self, rest_client: BybitREST):
+    def __init__(self, rest_client: BybitREST, db=None):
         self.rest = rest_client
+        self.db = db  # DatabaseManager для persistence алертов
         
         # symbol -> { 'm5': list, 'm15': list, 'levels': list, 'last_alert': dict, 'radar': CoinRadarMetrics | None }
         self.data: Dict[str, Dict[str, Any]] = {}
         
-        self.btc_ctx: Dict[str, Any] = {
-            'trend': 'UNKNOWN',
-            'change_1h': 0.0,
-            'change_4h': 0.0,
-            'hot_sector_coins': [],
-            'last_update': 0,
-        }
+        self.btc_ctx = {}
+        try:
+            self.btc_symbol = config.macro_filter.btc_symbol
+        except AttributeError:
+            self.btc_symbol = "BTCUSDT"
+            
+        self._alerts_sent_today = 0
+        self._current_date = ""
+        self._alert_timestamps_for_burst = []  # Burst tracker
         
-        self._alerts_sent_today: int = 0
-        self._alerts_date: str = datetime.date.today().isoformat()
         self._failed_alerts = []
+        self._failed_alerts_lock = asyncio.Lock()
         
     def _check_daily_limit(self) -> bool:
-        """Проверяет не превышен ли дневной лимит алертов."""
-        today = datetime.date.today().isoformat()
-        if today != self._alerts_date:
-            self._alerts_sent_today = 0
-            self._alerts_date = today
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        tz_str = config.timezone if hasattr(config, 'timezone') else 'Europe/Moscow'
         
-        max_alerts = config.telegram.max_sniper_alerts_per_day if hasattr(config, 'telegram') and hasattr(config.telegram, 'max_sniper_alerts_per_day') else 15
-        if self._alerts_sent_today >= max_alerts:
-            logger.warning(
-                f"Daily alert limit reached: {self._alerts_sent_today}/{max_alerts}"
-            )
+        now = datetime.datetime.now(ZoneInfo(tz_str))
+        date_str = now.strftime("%Y-%m-%d")
+        
+        if self._current_date != date_str:
+            self._current_date = date_str
+            self._alerts_sent_today = 0
+            self._alert_timestamps_for_burst.clear()  # New for burst tracking
+            
+        limit = config.alerts.max_daily_alerts
+        if self._alerts_sent_today >= limit:
+            logger.warning(f"Daily alert limit reached: {self._alerts_sent_today}/{limit}")
             return False
+            
+        # --- Burst protection during extreme macros (STRONG_DOWN / STRONG_UP) ---
+        current_ts = time.time()
+        # Clean up old timestamps (> 15 mins)
+        if not hasattr(self, '_alert_timestamps_for_burst'):
+            self._alert_timestamps_for_burst = []
+        
+        self._alert_timestamps_for_burst = [
+            ts for ts in self._alert_timestamps_for_burst 
+            if current_ts - ts < 900  # 15 minutes window
+        ]
+        
+        btc_trend = self.btc_ctx.get('trend', 'FLAT')
+        if btc_trend in ('STRONG_DOWN', 'STRONG_UP'):
+            # Allow max 3 alerts per 15 minutes during extreme trends to prevent spam
+            if len(self._alert_timestamps_for_burst) >= 3:
+                logger.warning(f"Burst limit reached! 3 alerts already sent in last 15m during BTC {btc_trend}.")
+                return False
+                
+        self._alert_timestamps_for_burst.append(current_ts)
         return True
         
     async def update_btc_context(self):
@@ -59,7 +90,7 @@ class CandleManager:
                 logger.warning("BTC context: not enough klines")
                 return
             
-            closes = [float(k[4]) for k in klines]  # k[4] = close
+            closes = [safe_float(k[4]) for k in klines]  # k[4] = close
             current = closes[-1]
             
             # Изменение за 1 час (текущая vs предыдущая закрытая)
@@ -115,11 +146,11 @@ class CandleManager:
             for k in klines_5:
                 formatted_5.append({
                     "open_time": k[0],
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5])
+                    "open": safe_float(k[1]),
+                    "high": safe_float(k[2]),
+                    "low": safe_float(k[3]),
+                    "close": safe_float(k[4]),
+                    "volume": safe_float(k[5])
                 })
             self.data[symbol]['m5'] = formatted_5
             await asyncio.sleep(0.5)
@@ -129,13 +160,34 @@ class CandleManager:
             for k in klines_15:
                 formatted_15.append({
                     "open_time": k[0],
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5])
+                    "open": safe_float(k[1]),
+                    "high": safe_float(k[2]),
+                    "low": safe_float(k[3]),
+                    "close": safe_float(k[4]),
+                    "volume": safe_float(k[5])
                 })
             self.data[symbol]['m15'] = formatted_15
+            
+            # Persistent cooldown load (Sprint 2 task)
+            if self.db:
+                try:
+                    recent = await self.db.get_symbol_alert_history(symbol, limit=10)
+                    now_ts = time.time()
+                    cooldown_sec = getattr(config.alerts, 'cooldown_hours', 4) * 3600
+                    for alt in recent:
+                        try:
+                            # Handle datetime from database
+                            dt = datetime.datetime.fromisoformat(alt['timestamp'].replace('Z', '+00:00'))
+                            ts = dt.timestamp()
+                            if now_ts - ts < cooldown_sec:
+                                level_id = f"{symbol}_{alt['level_price']}"
+                                self.data[symbol]['last_alert'][level_id] = ts
+                        except Exception:
+                            pass
+                    if self.data[symbol]['last_alert']:
+                        logger.debug(f"Loaded {len(self.data[symbol]['last_alert'])} active cooldowns for {symbol} from DB")
+                except Exception as e:
+                    logger.error(f"Failed to load DB cooldown history for {symbol}: {e}")
             
         except Exception as e:
             logger.error(f"Failed to init historical candles for {symbol}: {e}")
@@ -169,6 +221,11 @@ class CandleManager:
         
         if symbol not in self.data:
             return
+
+        # CRITICAL FIX: Only process M5 and M15 candles.
+        # H1 (kline.60) was corrupting M15 buffer — see audit item 0.1
+        if interval not in ("5", "15"):
+            return
             
         candle_closed = False  # НОВОЕ: флаг закрытия свечи
             
@@ -192,11 +249,11 @@ class CandleManager:
                 
             updated_candle = {
                 "open_time": start,
-                "open": float(k['open']),
-                "high": float(k['high']),
-                "low": float(k['low']),
-                "close": float(k['close']),
-                "volume": float(k['volume']),
+                "open": safe_float(k['open']),
+                "high": safe_float(k['high']),
+                "low": safe_float(k['low']),
+                "close": safe_float(k['close']),
+                "volume": safe_float(k['volume']),
                 "confirmed": is_confirmed,  # НОВОЕ: сохраняем статус
             }
             
@@ -232,24 +289,14 @@ class CandleManager:
             f"M15: {len(sym_data.get('m15', []))}"
         )
         
-        if hasattr(config.triggers, 'model_dump'):
-            cfg = config.triggers.model_dump()
-        elif hasattr(config.triggers, 'dict'):
-            cfg = config.triggers.dict()
-        else:
-            cfg = config.triggers.__dict__
-            
-        scoring_cfg = {}
-        if hasattr(config.scoring, 'model_dump'):
-            scoring_cfg = config.scoring.model_dump()
-        elif hasattr(config.scoring, 'dict'):
-            scoring_cfg = config.scoring.dict()
-        else:
-            scoring_cfg = config.scoring.__dict__
-            
-        alerts_cfg = {}
-        if hasattr(config.alerts, 'model_dump'):
-            alerts_cfg = config.alerts.model_dump()
+        def _to_dict(obj):
+            if hasattr(obj, 'model_dump'): return obj.model_dump()
+            if hasattr(obj, 'dict'): return obj.dict()
+            return vars(obj)
+        
+        cfg = _to_dict(config.triggers)
+        scoring_cfg = _to_dict(config.scoring)
+        alerts_cfg = _to_dict(config.alerts)
             
         cooldown_seconds = config.alerts.cooldown_hours * 3600
 
@@ -320,7 +367,7 @@ class CandleManager:
                 parts = alerted_level_id.split('_')
                 if len(parts) >= 2:
                     try:
-                        alerted_price = float(parts[1])
+                        alerted_price = safe_float(parts[1])
                         if abs(alerted_price - level['price']) / (level['price'] or 1.0) < 0.005:
                             if now - last_ts <= cooldown_seconds:
                                 on_cooldown = True
@@ -332,10 +379,11 @@ class CandleManager:
                 
                 # Calculate final score
                 score = 0
-                if sym_data['radar']:
+                if sym_data.get('radar'):
                     score, bd = calculate_final_score(sym_data['radar'], level, trigger, self.btc_ctx, scoring_cfg)
                 else:
                     score = 50 # Default if no radar
+                    bd = {}
                     
                 # Filter by score
                 min_score = scoring_cfg.get('min_score_for_alert', 65)
@@ -351,7 +399,7 @@ class CandleManager:
                         if tier_cfg['min_score'] <= score <= tier_cfg['max_score']:
                             priority = tier_name
                 
-                risk_data = self._calculate_stop_and_target(symbol, level, direction)
+                risk_data = calculate_stop_and_target(sym_data, symbol, level, direction, config)
                 max_stop = getattr(config.risk, 'max_stop_pct', 3.0) if hasattr(config, 'risk') else 3.0
                 if risk_data['calculable'] and risk_data['stop_pct'] > max_stop:
                     logger.info(
@@ -366,6 +414,38 @@ class CandleManager:
                             
                 sym_data['last_alert'][level_id] = now
                 msg = self._format_trigger_alert(symbol, level, trigger, score, priority, risk_data)
+                
+                # Persist alert to database for analytics & AI calibration
+                if self.db:
+                    try:
+                        radar = sym_data.get('radar')
+                        entry_price = safe_float(sym_data['m5'][-1]['close']) if sym_data['m5'] else 0.0
+                        db_kwargs = dict(
+                            symbol=symbol,
+                            direction=direction,
+                            signal_type=trigger['pattern'],
+                            level_price=level['price'],
+                            entry_price=entry_price,
+                            stop_price=risk_data.get('stop_price', 0),
+                            target_price=risk_data.get('target_price', 0),
+                            total_score=score,
+                            score_breakdown=bd if sym_data.get('radar') else {},
+                            rvol=radar.rvol if radar else 0,
+                            delta_oi_pct=radar.delta_oi_4h_pct if radar else 0,
+                            funding_rate=radar.funding_rate if radar else 0,
+                            btc_trend=self.btc_ctx.get('trend', 'UNKNOWN'),
+                        )
+                        
+                        # FIRE AND FORGET: Prevent SQLite I/O from blocking WS loop
+                        async def _bg_db_insert(kwargs):
+                            try:
+                                await self.db.insert_alert(**kwargs)
+                            except Exception as e:
+                                logger.error(f"Background DB insert failed: {e}")
+                                
+                        asyncio.create_task(_bg_db_insert(db_kwargs))
+                    except Exception as e:
+                        logger.error(f"Failed to schedule DB alert insert: {e}")
                 logger.warning(f"🚨 TRIGGER ({priority}, {score}): {symbol} near {level['price']}!")
                 
                 # Quiet hours check
@@ -417,86 +497,32 @@ class CandleManager:
             logger.info(f"📨 Alert sent: {symbol} ({'silent' if silent else 'loud'})")
         except Exception as e:
             logger.error(f"❌ Telegram alert failed for {symbol}: {e}. Queuing for retry.")
-            self._failed_alerts.append({
-                'msg': msg, 'silent': silent, 'symbol': symbol, 'timestamp': time.time()
-            })
+            async with self._failed_alerts_lock:
+                self._failed_alerts.append({
+                    'msg': msg, 'silent': silent, 'symbol': symbol, 'timestamp': time.time()
+                })
             
     async def retry_failed_alerts_loop(self):
         while True:
             await asyncio.sleep(60)
-            for alert in list(self._failed_alerts):
+            # Safely snapshot and clear under lock to prevent race conditions
+            async with self._failed_alerts_lock:
+                to_retry = list(self._failed_alerts)
+                self._failed_alerts.clear()
+            
+            still_failed = []
+            for alert in to_retry:
                 try:
                     await send_telegram_alert(alert['msg'], alert['silent'])
-                    if alert in self._failed_alerts:
-                        self._failed_alerts.remove(alert)
+                    logger.info(f"📨 Retry succeeded: {alert['symbol']}")
                 except Exception:
-                    if time.time() - alert['timestamp'] > 3600:
-                        if alert in self._failed_alerts:
-                            self._failed_alerts.remove(alert)  # Remove stale alert
+                    if time.time() - alert['timestamp'] < 3600:
+                        still_failed.append(alert)  # Keep for next retry
+            
+            if still_failed:
+                async with self._failed_alerts_lock:
+                    self._failed_alerts.extend(still_failed)
 
-
-    def _calculate_stop_and_target(
-        self, symbol: str, level: dict, direction: str
-    ) -> Dict[str, float]:
-        """
-        Рассчитывает стоп, цель и размер позиции
-        на основе реального ATR монеты.
-        """
-        sym_data = self.data.get(symbol)
-        
-        # Fallback: если нет данных M15
-        if not sym_data or len(sym_data['m15']) < 14:
-            return {
-                'stop_pct': 1.5,
-                'stop_price': 0.0,
-                'target_price': 0.0,
-                'position_size': 0.0,
-                'atr_value': 0.0,
-                'calculable': False,
-            }
-        
-        # Считаем ATR(14) на M15
-        candles = sym_data['m15'][-14:]
-        ranges = [float(c['high']) - float(c['low']) for c in candles]
-        atr = sum(ranges) / len(ranges)
-        
-        current_price = float(sym_data['m15'][-1]['close'])
-        if current_price == 0:
-            return {'calculable': False, 'stop_pct': 1.5, 'stop_price': 0,
-                    'target_price': 0, 'position_size': 0, 'atr_value': 0}
-        
-        # Стоп = уровень ± (ATR × multiplier)
-        atr_stop_multiplier = getattr(config.risk, 'atr_stop_multiplier', 0.5) if hasattr(config, 'risk') else 0.5
-        stop_distance = atr * atr_stop_multiplier
-        stop_pct = (stop_distance / current_price) * 100
-        
-        # Клэмп: минимум 0.3%, максимум max_stop_pct из конфига
-        max_stop = getattr(config.risk, 'max_stop_pct', 3.0) if hasattr(config, 'risk') else 3.0
-        stop_pct = max(0.3, min(max_stop, stop_pct))
-        stop_distance = current_price * (stop_pct / 100)
-        
-        rr = getattr(config.risk, 'default_rr_ratio', 2.0) if hasattr(config, 'risk') else 2.0
-        
-        if direction == 'LONG':
-            stop_price = level['price'] - stop_distance
-            target_price = current_price + (stop_distance * rr)
-        else:
-            stop_price = level['price'] + stop_distance
-            target_price = current_price - (stop_distance * rr)
-        
-        # Размер позиции
-        risk_usd = getattr(config.risk, 'risk_per_trade_usd', 20) if hasattr(config, 'risk') else 20
-        position_size = risk_usd / (stop_pct / 100) if stop_pct > 0 else 0
-        
-        return {
-            'stop_pct': round(stop_pct, 2),
-            'stop_price': round(stop_price, 8),
-            'target_price': round(target_price, 8),
-            'position_size': round(position_size, 0),
-            'atr_value': round(atr, 8),
-            'rr_ratio': rr,
-            'calculable': True,
-        }
 
     def _format_trigger_alert(self, symbol: str, level: dict, trigger: dict, score: int, priority: str, risk_data: dict | None = None) -> str:
         direction = trigger.get('direction')
@@ -505,7 +531,8 @@ class CandleManager:
         
         # Use pre-calculated risk_data if provided, otherwise calculate
         if risk_data is None:
-            risk_data = self._calculate_stop_and_target(symbol, level, direction)
+            sym_data = self.data.get(symbol)
+            risk_data = calculate_stop_and_target(sym_data, symbol, level, direction, config)
 
         # Priority-based header design
         if priority == "critical":

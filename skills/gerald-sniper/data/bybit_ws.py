@@ -7,7 +7,7 @@ from typing import Set, Callable, Dict
 
 class ExponentialBackoff:
     """Exponential backoff with fallback URL support."""
-    def __init__(self, base: float = 2, max_delay: float = 300, max_attempts_before_fallback: int = 10):
+    def __init__(self, base: float = 2, max_delay: float = 60, max_attempts_before_fallback: int = 5):
         self.base = base
         self.max_delay = max_delay
         self.max_attempts_before_fallback = max_attempts_before_fallback
@@ -44,6 +44,9 @@ class BybitWSManager:
         self.session = aiohttp.ClientSession()
         backoff = ExponentialBackoff()
         current_url = self.ws_url
+        _last_working_url = None  # Запоминаем последний рабочий URL
+        _last_primary_probe = 0.0
+        _primary_probe_interval = 600  # Пробовать primary каждые 10 мин
         
         while self._running:
             try:
@@ -52,25 +55,41 @@ class BybitWSManager:
                     self.ws = ws
                     logger.info("WS Connected.")
                     backoff.reset()
-                    current_url = self.ws_url  # Reset to primary on success
+                    _last_working_url = current_url  # Запомнить рабочий URL
                     
                     if self._subscriptions:
                         await self._send_subscribe(list(self._subscriptions))
                     
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            
-                            # Handle standard PONG
-                            if data.get("op") == "pong":
-                                continue
+                    async def ping_loop():
+                        try:
+                            while not ws.closed:
+                                await asyncio.sleep(15)  # 20 сек было рискованно, Bybit дропает без пинга через 30с лояльно, ставим 15.
+                                if not ws.closed:
+                                    await ws.send_json({"req_id": str(uuid.uuid4()), "op": "ping"})
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as e:
+                            logger.error(f"WS ping loop error: {e}")
+
+                    ping_task = asyncio.create_task(ping_loop())
+
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
                                 
-                            for cb in self.callbacks:
-                                asyncio.create_task(cb(data))
-                                
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            logger.error(f"WS connection lost: {msg.type}")
-                            break
+                                # Handle standard PONG
+                                if data.get("op") == "pong":
+                                    continue
+                                    
+                                for cb in self.callbacks:
+                                    asyncio.create_task(cb(data))
+                                    
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                logger.error(f"WS connection lost: {msg.type}")
+                                break
+                    finally:
+                        ping_task.cancel()
                             
             except asyncio.CancelledError:
                 logger.info("WS connection task cancelled.")
@@ -80,9 +99,24 @@ class BybitWSManager:
                 logger.error(f"WS connection error: {e}")
                 
             if self._running:
-                if backoff.should_try_fallback():
-                    current_url = self.ws_url_fallback
                 delay = backoff.next_delay()
+                
+                # Переключение URL при исчерпании попыток
+                if backoff.should_try_fallback():
+                    if current_url == self.ws_url:
+                        if self.ws_url_fallback:
+                            current_url = self.ws_url_fallback
+                            logger.warning(f"🔄 Switching to fallback WS: {current_url}")
+                            backoff.reset()
+                    else:
+                        import time
+                        now = time.monotonic()
+                        if now - _last_primary_probe > _primary_probe_interval:
+                            _last_primary_probe = now
+                            current_url = self.ws_url
+                            logger.info(f"🔍 Probing primary WS: {current_url}")
+                            backoff.reset()
+                
                 logger.info(f"Reconnecting in {delay:.0f}s (attempt #{backoff.attempt})...")
                 await asyncio.sleep(delay)
 
@@ -115,11 +149,10 @@ class BybitWSManager:
         """Smart update: unsubscribe old, subscribe new."""
         desired_topics = set()
         for sym in symbols:
-            desired_topics.add(f"kline.60.{sym}")
+            # Only subscribe to timeframes we actually process in handle_ws_message
+            # kline.60, tickers, liquidation were subscribed but NEVER processed — wasted bandwidth
             desired_topics.add(f"kline.15.{sym}")
             desired_topics.add(f"kline.5.{sym}")
-            desired_topics.add(f"tickers.{sym}")
-            desired_topics.add(f"liquidation.{sym}")
 
         to_add = desired_topics - self._subscriptions
         to_remove = self._subscriptions - desired_topics

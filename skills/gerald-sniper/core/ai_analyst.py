@@ -47,7 +47,8 @@ class GeraldSniperAnalyst:
                     "extra_body": {
                         "provider": {
                             "order": ["OpenAI"],
-                            "require": ["openai"],
+                            "ignore": ["Azure"],
+                            "allow_fallbacks": True,
                         },
                         "route": "fallback",
                     }
@@ -82,11 +83,19 @@ class GeraldSniperAnalyst:
                 "Используй иконки 💰🔥."
             )
 
-            result = await self.router.generate_structured(
-                prompt=prompt,
-                response_model=MarketAnalysisOutput,
-                task_type="simple"
-            )
+            import asyncio
+            try:
+                result = await asyncio.wait_for(
+                    self.router.generate_structured(
+                        prompt=prompt,
+                        response_model=MarketAnalysisOutput,
+                        task_type="simple"
+                    ),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("LLM Analyst timed out (10s), using fallback text.")
+                return "🤖 <b>AI RADAR │ NEUTRAL</b>\nРадар перегружен, ИИ-резюме недоступно ⏳"
             
             sentiment_emoji = "🟢" if result.sentiment == "bullish" else "🔴" if result.sentiment == "bearish" else "⚪"
             
