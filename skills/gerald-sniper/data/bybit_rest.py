@@ -38,8 +38,10 @@ class BybitREST:
         self._last_primary_check = 0.0
         self._primary_recheck_interval = 600    # Каждые 10 мин пробовать primary
         
-        self._rate_semaphore = asyncio.Semaphore(5)  # Макс 5 параллельных
-        self._rate_delay = 0.15  # 150ms между запросами
+        self._rate_semaphore = asyncio.Semaphore(7)  # Выше concurrency для 120 тикеров
+        self._rate_delay = 0.2  # 200ms между запросами (чтобы не душить API)
+        self._max_rate_delay = 5.0
+        self._min_rate_delay = 0.1
 
     @property
     def _active_url(self) -> str:
@@ -55,7 +57,8 @@ class BybitREST:
 
     async def _get_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=15)
+            # Увеличенный таймаут сессии для предотвращения отвалов на плохом коннекте
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
             self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
 
@@ -165,24 +168,31 @@ class BybitREST:
 
         for attempt in range(retries):
             try:
-                async with session.request(method, url, params=params) as response:
+                # Индивидуальный явный таймаут для запроса
+                req_timeout = aiohttp.ClientTimeout(total=15)
+                async with session.request(method, url, params=params, timeout=req_timeout) as response:
                     if response.status == 200:
                         data = await response.json()
                         ret_code = data.get("retCode")
                         if ret_code == 0:
                             self._record_success()
+                            # Decrease rate delay gracefully upon success
+                            self._rate_delay = max(self._min_rate_delay, self._rate_delay * 0.95)
                             return data.get("result", {})
                         elif ret_code in (10006, 10018) or "Too many visits" in str(data.get("retMsg")):
-                            wait_time = 2 ** attempt
-                            logger.warning(f"Rate limited (retCode {ret_code}) on {url}. Waiting {wait_time}s...")
+                            # Adaptive rate limiter: slow down exponentially if warned
+                            self._rate_delay = min(self._max_rate_delay, self._rate_delay * 2.0)
+                            wait_time = (2 ** attempt) + self._rate_delay
+                            logger.warning(f"Rate limited (retCode {ret_code}) on {url}. Adaptive delay updated to {self._rate_delay:.2f}s. Waiting {wait_time:.2f}s...")
                             await asyncio.sleep(wait_time)
                             continue
                         else:
                             logger.error(f"Bybit API Error: {data.get('retMsg')} for url {url}")
                             return {}
                     elif response.status == 429:
-                        wait_time = 2 ** attempt
-                        logger.warning(f"Rate limited (429) on {url}. Waiting {wait_time}s...")
+                        self._rate_delay = min(self._max_rate_delay, self._rate_delay * 2.0)
+                        wait_time = (2 ** attempt) + self._rate_delay
+                        logger.warning(f"Rate limited (429) on {url}. Adaptive delay updated to {self._rate_delay:.2f}s. Waiting {wait_time:.2f}s...")
                         await asyncio.sleep(wait_time)
                         continue
                     else:

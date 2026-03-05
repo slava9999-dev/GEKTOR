@@ -158,7 +158,7 @@ def detect_levels(
         # with a small KDE-derived expansion to account for cluster width.
         actual_bw_price = bw * scott_factor * data_std if data_std > 0 else 0
         kde_zone_pct = (actual_bw_price / current_price * 0.45) if current_price > 0 else 0
-        zone_tolerance = max(dynamic_tolerance, min(kde_zone_pct, dynamic_tolerance * 3))
+        zone_tolerance = max(dynamic_tolerance, min(kde_zone_pct, dynamic_tolerance * 5))
 
         zone_low = level_price * (1 - zone_tolerance)
         zone_high = level_price * (1 + zone_tolerance)
@@ -171,8 +171,12 @@ def detect_levels(
         sup_touches = int(np.sum(sup_mask))
         total_touches = res_touches + sup_touches
 
-        if total_touches < min_touches:
-            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches < {min_touches} required")
+        # For KDE levels, the peak itself inherently proves price clustering.
+        # We can be slightly more lenient on exact rigid touches.
+        min_touches_kde = max(1, min_touches - 1)
+
+        if total_touches < min_touches_kde:
+            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches < {min_touches_kde} required (KDE softened)")
             continue
 
         # Chop-zone progressive penalty instead of hard rejection
