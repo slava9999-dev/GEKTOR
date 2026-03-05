@@ -50,10 +50,11 @@ class GeraldBridgeV2:
                     "supports_json_object": True,
                     "extra_body": {
                         "provider": {
-                            "order": ["OpenAI"],  # Bypass Azure filters
-                            "require": ["openai"],  # Hard requirement: only OpenAI backend
+                            "order": ["OpenAI"],
+                            "ignore": ["Azure"],
+                            "allow_fallbacks": True,
                         },
-                        "route": "fallback",  # Force fallback routing (skips Azure primary)
+                        "route": "fallback",
                     },
                     "extra_headers": {
                         "HTTP-Referer": "https://gerald-superbrain.local",
@@ -75,7 +76,7 @@ class GeraldBridgeV2:
         self.llm_router = SmartRouter(llm_config)
         self.agent = GeraldAgent(self.llm_router)
         self.indexer = BackgroundIndexer(self.agent.vector_db)
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.token = os.getenv("GERALD_BOT_TOKEN")
         self.chat_id = int(os.getenv("TELEGRAM_CHAT_ID", 0))
         self.offset = self._load_offset()
         self._consecutive_errors = 0
@@ -136,9 +137,13 @@ class GeraldBridgeV2:
                     text = msg["text"]
 
                     if cid == self.chat_id:
-                        logger.info(f"TG Message from Slava: {text[:50]}...")
-                        # Process immediately
-                        asyncio.create_task(self.handle_message(text))
+                        # Route sniper commands directly to DB
+                        if text.startswith(("/win", "/loss", "/skip", "/stats", "/report")):
+                            logger.info(f"Sniper command: {text}")
+                            asyncio.create_task(self._handle_sniper_command(text))
+                        else:
+                            logger.info(f"TG Message from Slava: {text[:50]}...")
+                            asyncio.create_task(self.handle_message(text))
                     else:
                         logger.warning(f"Unauthorized TG access from {cid}")
         except Exception as e:
@@ -146,6 +151,73 @@ class GeraldBridgeV2:
             backoff = min(60, 5 * self._consecutive_errors)
             logger.error(f"TG Poll error: {e}. Backing off for {backoff}s...")
             await asyncio.sleep(backoff)
+
+    async def _handle_sniper_command(self, text: str):
+        """Routes /win, /loss, /skip, /stats, /report to sniper DB."""
+        try:
+            import sys as _sys
+            sniper_path = os.path.join(BASE_DIR, "skills", "gerald-sniper")
+            if sniper_path not in _sys.path:
+                _sys.path.insert(0, sniper_path)
+            from data.database import DatabaseManager
+
+            db_path = os.path.join(BASE_DIR, "skills", "gerald-sniper", "data_run", "sniper.db")
+            db = DatabaseManager(db_path)
+            await db.initialize()
+
+            parts = text.strip().split()
+            cmd = parts[0].lower()
+
+            if cmd == "/stats":
+                stats = await db.get_alert_stats(days=30)
+                import json as _json
+                reply = f"📊 Stats (30d):\n{_json.dumps(stats, ensure_ascii=False, indent=2)}"
+
+            elif cmd == "/report":
+                reply = await db.get_weekly_summary()
+
+            elif cmd in ("/win", "/loss", "/skip"):
+                if len(parts) < 2:
+                    reply = f"❌ Формат: {cmd} СИМВОЛ [pnl%]\nПример: {cmd} BTCUSDT 5.2"
+                else:
+                    import aiosqlite
+                    symbol = parts[1].upper()
+                    if not symbol.endswith("USDT"):
+                        symbol += "USDT"
+                    result = cmd.lstrip("/").upper()
+                    pnl = 0.0
+                    if len(parts) > 2:
+                        try:
+                            pnl = float(parts[2].replace(",", "."))
+                        except ValueError:
+                            pass
+                    notes = " ".join(parts[3:]) if len(parts) > 3 else ""
+
+                    async with aiosqlite.connect(db_path) as conn:
+                        conn.row_factory = aiosqlite.Row
+                        cur = await conn.execute(
+                            "SELECT id, timestamp, level_price FROM alerts WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1",
+                            (symbol,)
+                        )
+                        row = await cur.fetchone()
+
+                    if not row:
+                        reply = f"❌ Алерты по {symbol} не найдены."
+                    else:
+                        await db.update_alert_result(row["id"], result, pnl, notes)
+                        emoji = "✅" if result == "WIN" else "❌" if result == "LOSS" else "⏭"
+                        reply = f"{emoji} {symbol} → {result} ({pnl:+.1f}%)\nАлерт от {row['timestamp'][:16]}"
+            else:
+                reply = "❓ Неизвестная команда."
+
+            # Send reply
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: requests.post(url, json={"chat_id": self.chat_id, "text": reply}, timeout=10)
+            )
+        except Exception as e:
+            logger.error(f"Sniper command error: {e}")
 
     async def handle_message(self, text: str):
         async with self._semaphore:

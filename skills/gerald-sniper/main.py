@@ -23,6 +23,17 @@ from core.radar import RadarScanner
 from core.level_detector import detect_all_levels
 from core.candle_manager import CandleManager
 from core.ai_analyst import analyst
+from core.telegram_tracker import TelegramOracle
+from utils.telegram_bot import send_telegram_alert
+
+
+def model_to_dict(obj) -> dict:
+    """Pydantic v1/v2 compatible dict conversion. Eliminates 6+ repeated blocks."""
+    if hasattr(obj, 'model_dump'):
+        return obj.model_dump()
+    if hasattr(obj, 'dict'):
+        return obj.dict()
+    return vars(obj)
 
 async def radar_loop(rest_client: BybitREST, ws_manager: BybitWSManager, db_manager: DatabaseManager, candle_mgr: CandleManager):
     """Periodically fetches all tickers, ranks them, and updates WS subscriptions."""
@@ -123,20 +134,32 @@ async def run_levels_for_watchlist(rest: BybitREST, radar_results: list[dict], d
                 
             current_price = formatted_klines[-1]['close']
             # Support both Pydantic v1 and v2 for dumping to dict
-            level_cfg = {}
-            if hasattr(config.levels, 'model_dump'):
-                level_cfg = config.levels.model_dump()
-            elif hasattr(config.levels, 'dict'):
-                level_cfg = config.levels.dict()
-            else:
-                level_cfg = config.levels.__dict__
+            level_cfg = model_to_dict(config.levels)
                 
             levels = detect_all_levels(formatted_klines, current_price, level_cfg)
             
-            # --- FILTER ---
-            # Remove weak levels and limit to top 2 per coin to prevent trigger spam
+            # --- SOURCE-DIVERSE FILTER ---
+            # Show top-3 with guaranteed KDE diversity when available.
+            # Prevents ROUND_NUMBER from always hiding KDE (audit finding:
+            # KDE with 22 touches hidden behind ROUND with 7 due to proximity scoring)
             levels = [l for l in levels if l['strength'] >= 50]
-            levels = sorted(levels, key=lambda x: -x['strength'])[:2]
+            levels = sorted(levels, key=lambda x: -x['strength'])
+            
+            kde_levels = [l for l in levels if 'KDE' in l.get('source', '')]
+            other_levels = [l for l in levels if 'KDE' not in l.get('source', '')]
+            
+            # Best KDE first, then fill with others, max 3 total
+            final_levels = []
+            if kde_levels:
+                final_levels.append(kde_levels[0])
+            for l in other_levels:
+                if len(final_levels) >= 3:
+                    break
+                final_levels.append(l)
+            # If no KDE, just take top-3 overall
+            if not final_levels:
+                final_levels = levels[:3]
+            levels = sorted(final_levels, key=lambda x: -x['strength'])[:3]
             
             if levels:
                 levels_found += len(levels)
@@ -194,7 +217,7 @@ async def main():
     ws_manager = BybitWSManager(ws_url=config.bybit.ws_url, ws_url_fallback=config.bybit.ws_url_fallback)
 
     # Hook WS data to CandleManager
-    candle_mgr = CandleManager(rest_client)
+    candle_mgr = CandleManager(rest_client, db=db_manager)
     
     async def btc_context_loop(candle_manager):
         while True:
@@ -249,16 +272,51 @@ async def main():
     
     cleanup_task = asyncio.create_task(db_cleanup_loop(db_manager))
 
+    async def weekly_report_loop(db_mgr):
+        """Runs the weekly performance report generation algorithm once a week."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        tz_str = config.timezone if hasattr(config, 'timezone') else 'Europe/Moscow'
+        tz = ZoneInfo(tz_str)
+        
+        while True:
+            try:
+                from datetime import datetime as dt
+                now = dt.now(tz)
+                # Sunday = 6. 20:00 (or config time)
+                if now.weekday() == 6 and now.hour == 20 and now.minute < 10:
+                    logger.info("📊 Generating weekly report...")
+                    report = await db_mgr.get_weekly_summary()
+                    await send_telegram_alert(report)
+                    await asyncio.sleep(3600)  # Avoid running multiple times per hour
+                else:
+                    await asyncio.sleep(300) # Check every 5 mins
+            except Exception as e:
+                logger.error(f"Weekly report error: {e}")
+                await asyncio.sleep(600)
+
+    weekly_report_task = asyncio.create_task(weekly_report_loop(db_manager))
+
+    # Initialize Telegram Oracle
+    tg_oracle = TelegramOracle(db=db_manager)
+    oracle_task = asyncio.create_task(tg_oracle.start())
+
+    tasks = [ws_task, radar_task, btc_task, retry_task, cleanup_task, weekly_report_task, oracle_task]
     try:
-        await asyncio.gather(ws_task, radar_task, btc_task, retry_task, cleanup_task)
-    except asyncio.CancelledError:
-        pass
-    except KeyboardInterrupt:
+        await asyncio.gather(*tasks)
+    except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
-        logger.info("Shutting down... Please wait.")
+        logger.info("Shutting down gracefully... Canceling tasks.")
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await tg_oracle.stop()
         await ws_manager.disconnect()
         await rest_client.close()
+        logger.info("✅ Shutdown complete.")
 
 if __name__ == "__main__":
     try:

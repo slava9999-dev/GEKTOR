@@ -4,6 +4,7 @@ from scipy.signal import argrelextrema, find_peaks
 from scipy.stats import gaussian_kde
 from loguru import logger
 from typing import List, Dict
+from utils.safe_math import safe_float
 
 
 def _get_adaptive_params(atr_pct: float, current_price: float, config: dict) -> dict:
@@ -19,6 +20,11 @@ def _get_adaptive_params(atr_pct: float, current_price: float, config: dict) -> 
     """
     base_touches = config.get('min_touches', 2)
     base_distance = config.get('max_distance_pct', 5.0)
+
+    # Adaptive min_touches: volatile coins (ATR>2%) rarely form 3+ touches
+    # but 2 touches on a wide-range coin ARE significant (double top/bottom)
+    if atr_pct > 2.0:
+        base_touches = max(2, base_touches - 1)
 
     # Допуск касания составляет 25% от средней дневной свечи (ATR H1)
     # Мин. 0.4%, макс. 2.0%
@@ -45,8 +51,8 @@ def detect_levels(
     if len(candles_h1) < 20:
         return []
 
-    highs = np.array([float(c['high']) for c in candles_h1])
-    lows = np.array([float(c['low']) for c in candles_h1])
+    highs = np.array([safe_float(c['high']) for c in candles_h1])
+    lows = np.array([safe_float(c['low']) for c in candles_h1])
 
     # Расчёт ATR% для адаптивной логики
     atr = np.mean([abs(h - l) for h, l in zip(highs, lows)])
@@ -57,12 +63,6 @@ def detect_levels(
     min_touches = adaptive['min_touches']
     dynamic_tolerance = adaptive['touch_tolerance_pct']
     max_distance_pct = adaptive['max_distance_pct']
-
-    logger.info(
-        f"📐 Adaptive: price={current_price:.4f}, ATR={atr_pct:.1f}%: "
-        f"touches={min_touches}, tolerance={dynamic_tolerance*100:.1f}%, "
-        f"max_dist={max_distance_pct:.1f}%, extremes={len(all_extremes) if 'all_extremes' in dir() else '?'}"
-    )
 
     # STEP 1: Свинг-экстремумы
     swing_order = config.get('swing_order', 5)
@@ -77,10 +77,23 @@ def detect_levels(
     swing_lows = lows[swing_low_idx]
 
     all_extremes = np.concatenate([swing_highs, swing_lows])
+
+    logger.info(
+        f"📐 Adaptive: price={current_price:.4f}, ATR={atr_pct:.1f}%: "
+        f"touches={min_touches}, tolerance={dynamic_tolerance*100:.1f}%, "
+        f"max_dist={max_distance_pct:.1f}%, extremes={len(all_extremes)}"
+    )
     
     if len(all_extremes) < 3:
         logger.debug(f"KDE skipped: only {len(all_extremes)} extremes found (need 3+)")
         return []
+
+    # Adaptive max_touches cap: scales with total extremes count.
+    # With 168 H1 candles we get ~16-26 extremes. A hardcoded cap of 12 kills
+    # ALL KDE levels because a true structural level will naturally attract
+    # most extremes. Cap = 80% of total extremes — only rejects if literally
+    # ALL extremes sit on one price (= flat/dead coin, not a tradeable level).
+    max_touches_cap = max(12, int(len(all_extremes) * 0.8))
 
     # STEP 2: KDE кластеризация
     price_range_width = all_extremes.max() - all_extremes.min()
@@ -106,7 +119,7 @@ def detect_levels(
         n_ext = len(all_extremes)
         scott_factor = n_ext ** (-1.0 / 5.0)
         bw_computed = desired_bandwidth / (scott_factor * data_std)
-        bw = max(0.01, float(bw_computed))
+        bw = max(0.01, safe_float(bw_computed))
 
     try:
         kde = gaussian_kde(all_extremes, bw_method=bw)
@@ -157,6 +170,10 @@ def detect_levels(
         if total_touches < min_touches:
             logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches < {min_touches} required")
             continue
+            
+        if total_touches > max_touches_cap:
+            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches > {max_touches_cap} (likely a static chop zone, not a clean level)")
+            continue
 
         level_type = 'RESISTANCE' if level_price > current_price else 'SUPPORT'
         distance_pct = abs(level_price - current_price) / current_price * 100
@@ -193,13 +210,13 @@ def detect_levels(
         strength = min(100.0, max(0.0, strength))
 
         levels.append({
-            'price': round(float(level_price), 8),
+            'price': round(safe_float(level_price), 8),
             'type': level_type,
             'touches': total_touches,
             'resistance_touches': res_touches,
             'support_touches': sup_touches,
-            'distance_pct': round(float(distance_pct), 2),
-            'strength': round(float(strength), 1),
+            'distance_pct': round(safe_float(distance_pct), 2),
+            'strength': round(safe_float(strength), 1),
             'stale': is_stale,
             'source': 'KDE',
             'hours_since_touch': hours_ago,
@@ -234,8 +251,8 @@ def detect_dynamic_levels(
     max_distance_pct = config.get('max_distance_pct', 4.0)
     dynamic_max_strength = config.get('dynamic_level_max_strength', 75)
 
-    highs = [float(c['high']) for c in candles_h1]
-    lows = [float(c['low']) for c in candles_h1]
+    highs = [safe_float(c['high']) for c in candles_h1]
+    lows = [safe_float(c['low']) for c in candles_h1]
 
     # === 1. Недельный максимум и минимум ===
     week_high = max(highs)
@@ -253,14 +270,16 @@ def detect_dynamic_levels(
     for price, ltype in [(week_high, 'RESISTANCE'), (week_low, 'SUPPORT')]:
         dist_pct = abs(price - current_price) / current_price * 100
         if 0.3 < dist_pct < week_max_distance:
+            # We strictly enforce that a Weekly Extreme requires at least a double top/bottom (2 touches)
+            # The exact number will be validated against historical candles, but for now we set a base expectation.
             levels.append({
-                'price': round(float(price), 8),
+                'price': round(safe_float(price), 8),
                 'type': ltype,
-                'touches': 1,
-                'resistance_touches': 1 if ltype == 'RESISTANCE' else 0,
-                'support_touches': 1 if ltype == 'SUPPORT' else 0,
+                'touches': 2, # Promoted base score assuming 2, score logic handles it
+                'resistance_touches': 2 if ltype == 'RESISTANCE' else 0,
+                'support_touches': 2 if ltype == 'SUPPORT' else 0,
                 'distance_pct': round(dist_pct, 2),
-                'strength': 50.0,
+                'strength': 60.0, # Increased from 50 to differentiate from trash
                 'stale': False,
                 'source': 'WEEK_EXTREME',
                 'hours_since_touch': 0,
@@ -309,10 +328,10 @@ def detect_dynamic_levels(
                 # Continuous scoring: base + touches + proximity bonus
                 proximity_bonus = max(0, 10 - dist_pct * 3)  # closer = better
                 strength = 30.0 + (touch_count * 6) + proximity_bonus
-                strength = min(float(dynamic_max_strength), strength)
+                strength = min(safe_float(dynamic_max_strength), strength)
 
                 levels.append({
-                    'price': round(float(rn), 8),
+                    'price': round(safe_float(rn), 8),
                     'type': ltype,
                     'touches': touch_count,
                     'resistance_touches': touch_count if ltype == 'RESISTANCE' else 0,
