@@ -151,9 +151,14 @@ def detect_levels(
         is_stale = False
         touch_indices = []
 
-        # Зона касания = max(0.3%, 45% от ширины KDE)
-        bw_pct = bw / current_price if current_price > 0 else 0
-        zone_tolerance = max(dynamic_tolerance, bw_pct * 0.45)
+        # Zone tolerance for touch counting.
+        # CRITICAL: `bw` is scipy's dimensionless bandwidth FACTOR, not price units.
+        # The actual bandwidth in price space = bw * scott_factor * data_std
+        # We use dynamic_tolerance (from ATR) as the primary zone width,
+        # with a small KDE-derived expansion to account for cluster width.
+        actual_bw_price = bw * scott_factor * data_std if data_std > 0 else 0
+        kde_zone_pct = (actual_bw_price / current_price * 0.45) if current_price > 0 else 0
+        zone_tolerance = max(dynamic_tolerance, min(kde_zone_pct, dynamic_tolerance * 3))
 
         zone_low = level_price * (1 - zone_tolerance)
         zone_high = level_price * (1 + zone_tolerance)
