@@ -12,6 +12,7 @@ from utils.telegram_bot import send_telegram_alert
 from core.scoring import calculate_final_score
 from core.risk import calculate_stop_and_target
 from utils.safe_math import safe_float
+from core.position_tracker import PaperTracker
 
 # No dummy GLOBAL_BTC_CTX needed as it's tracked in CandleManager
 
@@ -35,8 +36,14 @@ class CandleManager:
         self._current_date = ""
         self._alert_timestamps_for_burst = []  # Burst tracker
         
+        self.tracker = PaperTracker(self.db)
+        
         self._failed_alerts = []
         self._failed_alerts_lock = asyncio.Lock()
+
+    async def initialize(self):
+        """Pre-load historical tracking states."""
+        await self.tracker.load_active_positions()
         
     def _check_daily_limit(self) -> bool:
         try:
@@ -272,6 +279,10 @@ class CandleManager:
         if candle_closed and (interval == "5" or interval == "15"):
             logger.debug(f"✅ Candle closed: {symbol} {interval}m | close={updated_candle['close']}")
             await self._check_triggers_for_symbol(symbol)
+            
+        # Постоянно сканируем Paper Trades в фоне
+        if interval == "5":
+            await self.tracker.check_prices({symbol: updated_candle['close']})
 
 
     async def _check_triggers_for_symbol(self, symbol: str):
@@ -439,7 +450,13 @@ class CandleManager:
                         # FIRE AND FORGET: Prevent SQLite I/O from blocking WS loop
                         async def _bg_db_insert(kwargs):
                             try:
-                                await self.db.insert_alert(**kwargs)
+                                alert_id = await self.db.insert_alert(**kwargs)
+                                if alert_id and risk_data and risk_data.get('calculable'):
+                                    self.tracker.add_position(
+                                        alert_id=alert_id, symbol=symbol, direction=direction,
+                                        entry_price=entry_price, stop_price=risk_data.get('stop_price', 0),
+                                        target_price=risk_data.get('target_price', 0)
+                                    )
                             except Exception as e:
                                 logger.error(f"Background DB insert failed: {e}")
                                 

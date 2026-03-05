@@ -147,7 +147,7 @@ class DatabaseManager:
         """Saves a fired alert for post-analysis by Gerald AI."""
         timestamp = datetime.utcnow().isoformat()
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
+            cursor = await db.execute("""
                 INSERT INTO alerts 
                 (timestamp, symbol, direction, signal_type, level_price, entry_price,
                  stop_suggestion, target_suggestion, total_score, score_breakdown,
@@ -160,6 +160,7 @@ class DatabaseManager:
                 rvol, delta_oi_pct, funding_rate, btc_trend
             ))
             await db.commit()
+            return cursor.lastrowid
 
     async def update_alert_result(self, alert_id: int, result: str, pnl_pct: float, notes: str = ""):
         """Updates an alert with the trade result (WIN/LOSS/SKIP)."""
@@ -223,6 +224,19 @@ class DatabaseManager:
     # =========================================================================
     # ANALYTICS — for Gerald AI to analyze alert quality & performance
     # =========================================================================
+
+    async def get_unresolved_alerts(self, days: int = 7) -> List[Dict[str, Any]]:
+        """Returns alerts without a result for paper trading tracking."""
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT id, symbol, direction, entry_price, stop_suggestion, target_suggestion, timestamp 
+                FROM alerts 
+                WHERE result IS NULL AND timestamp > ?
+            """, (cutoff,))
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
 
     async def get_recent_alerts(self, days: int = 7, limit: int = 50) -> List[Dict[str, Any]]:
         """Returns recent alerts for AI review."""

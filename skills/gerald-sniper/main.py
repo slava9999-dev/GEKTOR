@@ -218,6 +218,7 @@ async def main():
 
     # Hook WS data to CandleManager
     candle_mgr = CandleManager(rest_client, db=db_manager)
+    await candle_mgr.initialize()
     
     async def btc_context_loop(candle_manager):
         while True:
