@@ -62,12 +62,10 @@
   - Отправляет в Telegram через `send_telegram_alert()`
   - Опционально: если подключен AI Analyst, добавить AI-комментарий к отчёту
 
-### 5. Реализовать update_alert_result через Telegram [LOW]
+### 5. Реализовать update_alert_result через Telegram [LOW / ЗАВЕРШЕНО ИНАЧЕ]
 
-- Добавить команды в бот: `/win 123`, `/loss 123 -1.2%`, `/skip 123`
-- Это позволит пользователю отмечать результаты сделок
-- На основе этих данных Gerald AI сможет считать реальный win rate
-- Для этого нужно сохранять alert_id и отправлять его в Telegram-сообщении
+- ~~Добавить команды в бот: `/win 123`, `/loss 123 -1.2%`, `/skip 123`~~
+- Решено архитектурно: Внедрен `PaperTracker` в ядро `CandleManager`, который автоматически трекает позиции через WebSocket цены и сам пишет WIN/LOSS в БД. Ручной ввод больше не требуется!
 
 ### 6. Auto-calibration suggestions [LOW]
 
@@ -83,8 +81,8 @@
 - DatabaseManager.get_alert_stats() — ✅ ГОТОВО
 - DatabaseManager.get_symbol_alert_history() — ✅ ГОТОВО
 - DatabaseManager.get_weekly_summary() — ✅ ГОТОВО
-- DatabaseManager.update_alert_result() — ✅ ГОТОВО
-- CandleManager → DatabaseManager injection — ❌ НЕ СДЕЛАНО
+- DatabaseManager.update_alert_result() — ✅ ГОТОВО (автоматизировано через PaperTracker)
+- CandleManager → DatabaseManager injection — ✅ ГОТОВО
 - Agent tool registration — ❌ НЕ СДЕЛАНО
 - Weekly report loop — ❌ НЕ СДЕЛАНО
 
