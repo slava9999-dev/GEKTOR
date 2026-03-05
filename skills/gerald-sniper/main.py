@@ -136,7 +136,7 @@ async def run_levels_for_watchlist(rest: BybitREST, radar_results: list[dict], d
             # Support both Pydantic v1 and v2 for dumping to dict
             level_cfg = model_to_dict(config.levels)
                 
-            levels = detect_all_levels(formatted_klines, current_price, level_cfg)
+            levels = detect_all_levels(formatted_klines, current_price, level_cfg, symbol=symbol)
             
             # --- SOURCE-DIVERSE FILTER ---
             # Show top-3 with guaranteed KDE diversity when available.

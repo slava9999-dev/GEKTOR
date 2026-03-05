@@ -11,6 +11,12 @@
       "cooldown_minutes": 15
     }
   },
+  "scanner_daemon": {
+    "poll_interval": 300,
+    "min_24h_turnover": 50000000,
+    "top_n_symbols": 30,
+    "compression_threshold": 0.15
+  },
   "telegram": {
     "enabled": true
   }

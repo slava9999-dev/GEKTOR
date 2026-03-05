@@ -1,6 +1,7 @@
 import aiohttp
 from loguru import logger
 from utils.config import config
+from utils.log_filter import mask_sensitive
 
 async def send_telegram_alert(message: str, parse_mode: str = "HTML", disable_notification: bool = False) -> bool:
     """Sends a message via Telegram bot."""
@@ -30,7 +31,14 @@ async def send_telegram_alert(message: str, parse_mode: str = "HTML", disable_no
                     logger.error(f"Failed to send Telegram message: {response.status} {error_text}")
                     return False
     except Exception as e:
-        logger.error(f"Telegram API Exception: {e}")
+        # Маскируем потенциальные утечки токена в ошибке
+        err_str = mask_sensitive(str(e))
+        if bot_token and len(bot_token) > 10:
+            err_str = err_str.replace(bot_token, "***TOKEN***")
+        logger.error(
+            f"Telegram API Exception: {type(e).__name__}: {err_str}",
+            exc_info=True
+        )
         return False
 
 def format_level_alert(symbol: str, level: dict) -> str:

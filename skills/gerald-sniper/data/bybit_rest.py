@@ -171,6 +171,23 @@ class BybitREST:
                 # Индивидуальный явный таймаут для запроса
                 req_timeout = aiohttp.ClientTimeout(total=15)
                 async with session.request(method, url, params=params, timeout=req_timeout) as response:
+                    # Rate limit headers check
+                    limit_status = response.headers.get('X-Bapi-Limit-Status')
+                    limit_reset = response.headers.get('X-Bapi-Limit-Reset-Timestamp')
+                    
+                    if limit_status and limit_reset:
+                        try:
+                            limit_left = int(limit_status)
+                            reset_ts = int(limit_reset) / 1000.0
+                            now = time.time()
+                            
+                            if limit_left < 20 and reset_ts > now:
+                                wait_sec = reset_ts - now + 0.1
+                                logger.warning(f"Rate limit low ({limit_left} left). Sleeping for {wait_sec:.2f}s until reset.")
+                                await asyncio.sleep(wait_sec)
+                        except (ValueError, TypeError):
+                            pass
+
                     if response.status == 200:
                         data = await response.json()
                         ret_code = data.get("retCode")

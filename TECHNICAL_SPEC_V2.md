@@ -1,19 +1,20 @@
-# ТЕХНИЧЕСКОЕ ЗАДАНИЕ (ТЗ) v2.0: "Gerald-SuperBrain"
+# ТЕХНИЧЕСКОЕ ЗАДАНИЕ (ТЗ) v2.1: "Combat Edition"
 
 **Статус:** Утверждено к разработке (Strict Constraints Edition)
-**Дата:** 2026-02-23
+**Дата:** 2026-02-24
 
 ---
 
 ## 1. АРХИТЕКТУРНЫЙ СТЕК (Strictly Enforced)
 
-**ЗАПРЕЩАЕТСЯ** использовать тяжеловесные AI-фреймворки (LangChain, LlamaIndex, AutoGen). Вся логика агента пишется на чистом **Python + asyncio**.
+**ОСНОВНОЙ ФРЕЙМВОРК:** OpenClaw (Gateway + Skills).
+**ЛОГИКА АГЕНТА:** Python + asyncio для кастомных модулей.
 
-- **Инференс LLM:** `llama-cpp-python` (Сервер + Python API).
-  - _Почему:_ Полный контроль над VRAM (`n_gpu_layers`) и аппаратная поддержка Grammar/JSON Schema.
-- **Vector DB (Память):** `LanceDB` или `SQLite-vec`.
-  - _Почему:_ Библиотеки, а не серверы. Живут в одном файле `memory.lance`, используют 0% ресурсов в простое.
-- **Embeddings:** `nomic-embed-text-v1.5` (через llama.cpp) или `MiniLM-L12-v2`.
+- **Инференс LLM:** Ollama (Primary + Cross-model logic) + llama-cpp-python (Local GGUF).
+  - _Ансамбль:_ Qwen2.5-7B для действий, Qwen2.5-Coder-14B для критики ответов.
+- **Vector DB:** ChromaDB (HttpClient).
+  - _Почему:_ Унификация с глобальным индексом файлов (26k+ чанков). Мульти-коллекционный поиск.
+- **Embeddings:** `paraphrase-multilingual-MiniLM-L12-v2`.
 
 ---
 

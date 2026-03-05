@@ -1,11 +1,11 @@
 {
   "screener_wss": {
-    "top_symbols_to_monitor": 100,
-    "whale_trade_usd_threshold": 1000000,
-    "liquidation_usd_threshold": 300000,
-    "cvd_spike_usd_threshold": 10000000,
-    "dom_wall_usd_threshold": 5000000,
-    "dom_top_n_symbols": 20,
+    "top_symbols_to_monitor": 300,
+    "whale_trade_usd_threshold": 600000,
+    "liquidation_usd_threshold": 150000,
+    "cvd_spike_usd_threshold": 5000000,
+    "dom_wall_usd_threshold": 2500000,
+    "dom_top_n_symbols": 50,
     "reconnect_interval_sec": 3600
   },
   "telegram": {

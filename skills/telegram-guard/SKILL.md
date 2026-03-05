@@ -22,6 +22,6 @@ Enables Gerald to reach Slava via Telegram for critical alerts, thermal warnings
 
 ## Configuration
 
-Stored in `skills/telegram-guard/config.json`.
-Token: 8103578701:AAF6HFJOJAaJYqUe1o-dfO2z-D5wy6aKyhE
-Chat ID: (auto-detected from first message)
+Stored in `skills/telegram-guard/config.json` or `.env`.
+Token: (hidden)
+Chat ID: (auto-detected from first message or set in `.env`)

@@ -374,15 +374,55 @@ def detect_dynamic_levels(
     return deduped
 
 
+def validate_kline_data(candles: List[Dict], symbol: str) -> List[Dict]:
+    """Фильтрует аномальные свечи перед расчётом уровней."""
+    if len(candles) < 20:
+        return candles
+
+    closes = [safe_float(c['close']) for c in candles[-50:]]
+    # safe guard if closes is empty somehow
+    median = sorted(closes)[len(closes) // 2] if closes else 1.0
+
+    clean = []
+    removed = 0
+    for c in candles:
+        close_p = safe_float(c['close'])
+        high_p = safe_float(c['high'])
+        low_p = safe_float(c['low'])
+
+        # Цена > 5x или < 0.2x от медианы последних 50 свечей
+        if close_p > median * 5 or close_p < median * 0.2:
+            removed += 1
+            continue
+
+        # Свеча с range > 50% от цены — аномалия
+        if high_p > 0 and (high_p - low_p) / high_p > 0.5:
+            removed += 1
+            continue
+
+        clean.append(c)
+
+    if removed > 0:
+        logger.warning(
+            f"🗑️ {symbol}: Removed {removed} anomalous "
+            f"candles (median={median:.6f})"
+        )
+
+    return clean
+
+
 def detect_all_levels(
     candles_h1: List[Dict],
     current_price: float,
-    config: Dict
+    config: Dict,
+    symbol: str = "UNKNOWN"
 ) -> List[Dict]:
     """
     Главная функция: объединяет KDE (структурные) и динамические уровни.
     Вызывается из main.py вместо detect_levels.
     """
+    candles_h1 = validate_kline_data(candles_h1, symbol)
+    
     # KDE-уровни (существующая логика с адаптивными порогами)
     kde_levels = detect_levels(candles_h1, current_price, config)
 

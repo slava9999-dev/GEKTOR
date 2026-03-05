@@ -18,7 +18,7 @@ import argparse
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Generator
+from typing import Generator, Optional
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,34 +31,28 @@ SCAN_PATHS = [
     r"C:\NeuroGUARDIAN",
     r"C:\CryptoAgent",
     r"C:\GEKTOR",
-
     # === Web / Platforms ===
     r"C:\WebdashboardNeuroexpert",
     r"C:\websaitNeuroExpert-master",
     r"C:\arsenal-platform",
     r"C:\arbarea-mobile-app",
-
     # === Bots & Automation ===
     r"C:\BotiNstsgram",
     r"C:\kontentkombain",
     r"C:\videopublik",
     r"C:\Voiceover",
     r"C:\vk_cover_project",
-
     # === Trading ===
     r"C:\RUSPANKTREIDER",
-
     # === Business / Other ===
     r"C:\1 PROEKT",
     r"C:\prorab",
     r"C:\Svoy-Dom-NN-52-main",
     r"C:\infografika marketplase",
-
     # === Workspaces & Config ===
     r"C:\workspaces",
     r"C:\cline",
     os.path.expanduser(r"~\.openclaw\workspace"),
-
     # === User folders ===
     os.path.expanduser(r"~\Documents"),
     os.path.expanduser(r"~\Desktop"),
@@ -67,48 +61,111 @@ SCAN_PATHS = [
 # File extensions to index
 TEXT_EXTENSIONS = {
     # Code
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
-    ".go", ".rs", ".c", ".cpp", ".h", ".hpp",
-    ".java", ".kt", ".scala", ".rb", ".php",
-    ".cs", ".fs", ".vb",
-    ".sql", ".graphql", ".gql",
-    ".sh", ".bash", ".zsh", ".ps1", ".psm1", ".bat", ".cmd",
+    ".py",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".go",
+    ".rs",
+    ".c",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".java",
+    ".kt",
+    ".scala",
+    ".rb",
+    ".php",
+    ".cs",
+    ".fs",
+    ".vb",
+    ".sql",
+    ".graphql",
+    ".gql",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".psm1",
+    ".bat",
+    ".cmd",
     # Config
-    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-    ".env.example", ".editorconfig",
-    ".dockerfile", ".dockerignore",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".env.example",
+    ".editorconfig",
+    ".dockerfile",
+    ".dockerignore",
     # Docs
-    ".md", ".txt", ".rst", ".adoc", ".org",
-    ".csv", ".tsv",
+    ".md",
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".org",
+    ".csv",
+    ".tsv",
     # Web
-    ".html", ".htm", ".css", ".scss", ".sass", ".less",
-    ".xml", ".svg",
+    ".html",
+    ".htm",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".xml",
+    ".svg",
     # Data
-    ".prisma", ".proto", ".thrift",
+    ".prisma",
+    ".proto",
+    ".thrift",
     # Logs (selective)
     ".log",
 }
 
 # Directories to always skip
 SKIP_DIRS = {
-    ".git", ".hg", ".svn",
-    "node_modules", "__pycache__", ".venv", "venv", "env",
-    ".next", ".nuxt", "dist", "build", "target", "out",
-    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    ".cargo", ".rustup",
-    "vendor", "bower_components",
-    ".idea", ".vscode",
-    "chroma", "chromadb-data",
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    ".next",
+    ".nuxt",
+    "dist",
+    "build",
+    "target",
+    "out",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cargo",
+    ".rustup",
+    "vendor",
+    "bower_components",
+    ".idea",
+    ".vscode",
+    "chroma",
+    "chromadb-data",
     "AppData",  # Skip AppData — too much noise
 }
 
 # File size limits
-MAX_FILE_SIZE_KB = 500       # Skip files > 500 KB
-MAX_TOTAL_FILES = 50_000     # Safety cap
+MAX_FILE_SIZE_KB = 500  # Skip files > 500 KB
+MAX_TOTAL_FILES = 50_000  # Safety cap
 
 # Chunking
-CHUNK_SIZE_CHARS = 1500      # ~375 tokens per chunk
-CHUNK_OVERLAP_CHARS = 200    # Overlap for context continuity
+CHUNK_SIZE_CHARS = 1200  # Optimized for v2.1
+CHUNK_OVERLAP_CHARS = 150  # Optimized for v2.1
 
 # ChromaDB
 CHROMA_HOST = "localhost"
@@ -122,6 +179,7 @@ INDEX_STATE_FILE = os.path.join(os.path.dirname(__file__), ".index_state.json")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def file_hash(filepath: str) -> str:
     """Fast hash of file content for change detection."""
@@ -161,7 +219,7 @@ def chunk_text(text: str, filepath: str) -> Generator[dict, None, None]:
             chunk_idx += 1
 
             # Keep overlap
-            overlap_lines = []
+            overlap_lines: list[str] = []
             overlap_size = 0
             for ol in reversed(current_chunk):
                 if overlap_size + len(ol) > CHUNK_OVERLAP_CHARS:
@@ -263,7 +321,8 @@ def save_index_state(state: dict):
 # Main Indexer
 # ---------------------------------------------------------------------------
 
-def index_to_chroma(paths: list[str] = None, force: bool = False):
+
+def index_to_chroma(paths: Optional[list[str]] = None, force: bool = False):
     """Main indexing loop: scan → chunk → embed → store in ChromaDB."""
     try:
         import chromadb
@@ -296,21 +355,23 @@ def index_to_chroma(paths: list[str] = None, force: bool = False):
         metadata={
             "description": "Indexed files from local filesystem",
             "created_by": "Gerald-SuperBrain file indexer",
-        }
+        },
     )
     print(f"  Collection: {COLLECTION_NAME} ({collection.count()} existing docs)")
     print()
 
     # Scan and index
     stats = {"scanned": 0, "indexed": 0, "skipped": 0, "chunks": 0, "errors": 0}
-    batch_ids = []
-    batch_docs = []
-    batch_metas = []
+    batch_ids: list[str] = []
+    batch_docs: list[str] = []
+    batch_metas: list[dict] = []
     BATCH_SIZE = 100
 
     def flush_batch():
         if batch_ids:
-            collection.upsert(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
+            collection.upsert(
+                ids=batch_ids, documents=batch_docs, metadatas=batch_metas
+            )
             batch_ids.clear()
             batch_docs.clear()
             batch_metas.clear()
@@ -336,7 +397,9 @@ def index_to_chroma(paths: list[str] = None, force: bool = False):
         rel_path = fpath  # Full path for findability
 
         for chunk in chunk_text(content, fpath):
-            chunk_id = f"{hashlib.md5(fpath.encode()).hexdigest()}_{chunk['chunk_index']}"
+            chunk_id = (
+                f"{hashlib.md5(fpath.encode()).hexdigest()}_{chunk['chunk_index']}"
+            )
 
             # Prepend file path context to chunk for better retrieval
             doc_text = f"[File: {rel_path}] (lines {chunk['line_start']}-{chunk['line_end']})\n{chunk['text']}"
@@ -450,12 +513,17 @@ def search_index(query: str, n_results: int = 5):
     print(f"Search: '{query}' ({n_results} results)")
     print("-" * 60)
 
-    if results["documents"] and results["documents"][0]:
-        for i, (doc, meta, dist) in enumerate(zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0]
-        )):
+    docs = results.get("documents")
+    metas = results.get("metadatas")
+    dists = results.get("distances")
+    if docs and metas and dists and docs[0] and metas[0] and dists[0]:
+        for i, (doc, meta, dist) in enumerate(
+            zip(
+                docs[0],
+                metas[0],
+                dists[0],
+            )
+        ):
             print(f"\n  [{i+1}] Score: {1 - dist:.3f} | {meta.get('filepath', '?')}")
             print(f"      Lines {meta.get('line_start')}-{meta.get('line_end')}")
             # Show first 200 chars
@@ -476,7 +544,9 @@ if __name__ == "__main__":
     parser.add_argument("--stats", action="store_true", help="Show index statistics")
     parser.add_argument("--clear", action="store_true", help="Clear all indexed data")
     parser.add_argument("--search", type=str, help="Test search query")
-    parser.add_argument("--results", type=int, default=5, help="Number of search results")
+    parser.add_argument(
+        "--results", type=int, default=5, help="Number of search results"
+    )
 
     args = parser.parse_args()
 
