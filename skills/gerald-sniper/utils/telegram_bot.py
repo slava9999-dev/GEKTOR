@@ -3,14 +3,20 @@ from loguru import logger
 from utils.config import config
 from utils.log_filter import mask_sensitive
 
-async def send_telegram_alert(message: str, parse_mode: str = "HTML", disable_notification: bool = False) -> bool:
-    """Sends a message via Telegram bot."""
+async def send_telegram_alert(
+    message: str, 
+    parse_mode: str = "HTML", 
+    disable_notification: bool = False,
+    reply_to_message_id: int | None = None,
+    reply_markup: dict | None = None
+) -> int | None:
+    """Sends a message via Telegram bot and returns the message_id."""
     bot_token = config.telegram.bot_token
     chat_id = config.telegram.chat_id
     
     if not bot_token or not chat_id:
         logger.warning("Telegram Bot Token or Chat ID not configured. Skipping alert.")
-        return False
+        return None
         
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
@@ -21,15 +27,21 @@ async def send_telegram_alert(message: str, parse_mode: str = "HTML", disable_no
         "disable_notification": disable_notification
     }
     
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=10) as response:
                 if response.status == 200:
-                    return True
+                    data = await response.json()
+                    return data.get('result', {}).get('message_id')
                 else:
                     error_text = await response.text()
                     logger.error(f"Failed to send Telegram message: {response.status} {error_text}")
-                    return False
+                    return None
     except Exception as e:
         # Маскируем потенциальные утечки токена в ошибке
         err_str = mask_sensitive(str(e))

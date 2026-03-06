@@ -427,6 +427,7 @@ class CandleManager:
                 msg = self._format_trigger_alert(symbol, level, trigger, score, priority, risk_data)
                 
                 # Persist alert to database for analytics & AI calibration
+                db_kwargs = None
                 if self.db:
                     try:
                         radar = sym_data.get('radar')
@@ -446,23 +447,9 @@ class CandleManager:
                             funding_rate=radar.funding_rate if radar else 0,
                             btc_trend=self.btc_ctx.get('trend', 'UNKNOWN'),
                         )
-                        
-                        # FIRE AND FORGET: Prevent SQLite I/O from blocking WS loop
-                        async def _bg_db_insert(kwargs):
-                            try:
-                                alert_id = await self.db.insert_alert(**kwargs)
-                                if alert_id and risk_data and risk_data.get('calculable'):
-                                    self.tracker.add_position(
-                                        alert_id=alert_id, symbol=symbol, direction=direction,
-                                        entry_price=entry_price, stop_price=risk_data.get('stop_price', 0),
-                                        target_price=risk_data.get('target_price', 0)
-                                    )
-                            except Exception as e:
-                                logger.error(f"Background DB insert failed: {e}")
-                                
-                        asyncio.create_task(_bg_db_insert(db_kwargs))
                     except Exception as e:
                         logger.error(f"Failed to schedule DB alert insert: {e}")
+                
                 logger.warning(f"🚨 TRIGGER ({priority}, {score}): {symbol} near {level['price']}!")
                 
                 # Quiet hours check
@@ -504,20 +491,74 @@ class CandleManager:
                         mute = False
                         
                 asyncio.create_task(
-                    self._safe_send_alert(msg, silent=(mute or priority == 'normal'), symbol=symbol)
+                    self._process_trigger_alert(
+                        symbol, level, trigger, score, direction, risk_data, db_kwargs, msg, mute, priority
+                    )
                 )
 
-    async def _safe_send_alert(self, msg: str, silent: bool, symbol: str):
+    async def _process_trigger_alert(self, symbol, level, trigger, score, direction, risk_data, db_kwargs, msg, mute, priority):
+        """Оркестратор: БД -> Telegram -> Async AI -> Telegram Reply"""
+        alert_id = None
+        if self.db and db_kwargs:
+            try:
+                alert_id = await self.db.insert_alert(**db_kwargs)
+                if alert_id and risk_data and risk_data.get('calculable'):
+                    self.tracker.add_position(
+                        alert_id=alert_id, symbol=symbol, direction=direction,
+                        entry_price=db_kwargs['entry_price'], stop_price=risk_data.get('stop_price', 0),
+                        target_price=risk_data.get('target_price', 0)
+                    )
+            except Exception as e:
+                logger.error(f"DB insert failed: {e}")
+                
+        # Fast Alert
+        from core.ai_analyst import analyst
+        if analyst.enabled:
+            msg += "\n\n🤖 <i>AI анализирует сетап...</i>"
+            
+        silent = (mute or priority == 'normal')
+        msg_id = await self._safe_send_alert(msg, silent=silent, symbol=symbol)
+        
+        # Async AI Analysis
+        if msg_id and analyst.enabled:
+            asyncio.create_task(self._run_async_analysis(msg_id, alert_id, symbol, level, trigger, score, risk_data))
+
+    async def _run_async_analysis(self, msg_id: int, alert_id: int | None, symbol: str, level: dict, trigger: dict, score: int, risk_data: dict):
+        from core.ai_analyst import analyst
+        analysis = await analyst.analyze_signal(symbol, level, trigger, score, risk_data, self.btc_ctx)
+        if analysis:
+            reply_msg = (
+                f"🧠 <b>AI Вердикт: {analysis['recommendation']}</b> ({analysis['conviction']}/10)\n"
+                f"📝 {analysis['reasoning']}"
+            )
+            markup = None
+            if alert_id:
+                markup = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "✅ TAKE", "callback_data": f"/take_{alert_id}"},
+                            {"text": "❌ SKIP", "callback_data": f"/skip_{alert_id}"}
+                        ]
+                    ]
+                }
+            try:
+                await send_telegram_alert(reply_msg, reply_to_message_id=msg_id, reply_markup=markup)
+            except Exception as e:
+                logger.error(f"Failed to send AI reply: {e}")
+
+    async def _safe_send_alert(self, msg: str, silent: bool, symbol: str) -> int | None:
         """Отправка с обработкой ошибок и логированием."""
         try:
-            await send_telegram_alert(msg, disable_notification=silent)
+            msg_id = await send_telegram_alert(msg, disable_notification=silent)
             logger.info(f"📨 Alert sent: {symbol} ({'silent' if silent else 'loud'})")
+            return msg_id
         except Exception as e:
             logger.error(f"❌ Telegram alert failed for {symbol}: {e}. Queuing for retry.")
             async with self._failed_alerts_lock:
                 self._failed_alerts.append({
                     'msg': msg, 'silent': silent, 'symbol': symbol, 'timestamp': time.time()
                 })
+            return None
             
     async def retry_failed_alerts_loop(self):
         while True:

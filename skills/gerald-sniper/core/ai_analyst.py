@@ -13,6 +13,11 @@ class MarketAnalysisOutput(BaseModel):
     summary: str
     sentiment: str  # BULLISH, BEARISH, NEUTRAL
 
+class SignalAnalysisOutput(BaseModel):
+    conviction: int
+    recommendation: str
+    reasoning: str
+
 class GeraldSniperAnalyst:
     """
     Complex AI Market Analysis using Cloud Router.
@@ -110,5 +115,50 @@ class GeraldSniperAnalyst:
         except Exception as e:
             logger.error(f"AI Analyst error: {e}")
             return ""
+
+    async def analyze_signal(self, symbol: str, level: dict, trigger: dict, score: int, risk_data: dict, btc_ctx: dict) -> dict | None:
+        if not self.enabled:
+            return None
+            
+        try:
+            prompt = (
+                f"Ты — Gerald Sniper, элитный крипто-трейдер.\n"
+                f"Твоя задача — проанализировать сетап и дать четкую рекомендацию.\n"
+                f"Монета: {symbol}\n"
+                f"Направление (Тип): {trigger.get('direction', 'UNKNOWN')}\n"
+                f"Паттерн: {trigger.get('pattern', 'UNKNOWN')} (score {score}/100)\n"
+                f"Описание: {trigger.get('description', '')}\n"
+                f"Уровень: {level.get('price')} (touches {level.get('touches')})\n"
+                f"Дистанция до уровня: {level.get('distance_pct')}%\n"
+                f"Stop Loss: {risk_data.get('stop_pct')}%\n"
+                f"Контекст BTC: {btc_ctx.get('trend')} (1h: {btc_ctx.get('change_1h')}%, 4h: {btc_ctx.get('change_4h')}%)\n\n"
+                "Выдай JSON в строгом формате:\n"
+                "- conviction: целое число от 1 до 10 (твоя уверенность в сделке, где 10 - верняк)\n"
+                "- recommendation: одно из значений: TAKE, WAIT, SKIP\n"
+                "- reasoning: 1 очень короткое предложение почему (максимум 100 символов, без воды).\n"
+            )
+
+            import asyncio
+            try:
+                result = await asyncio.wait_for(
+                    self.router.generate_structured(
+                        prompt=prompt,
+                        response_model=SignalAnalysisOutput,
+                        task_type="simple"
+                    ),
+                    timeout=15.0
+                )
+                return {
+                    "conviction": result.conviction,
+                    "recommendation": result.recommendation.upper(),
+                    "reasoning": result.reasoning
+                }
+            except asyncio.TimeoutError:
+                logger.warning(f"LLM SignalAnalysis timed out for {symbol}.")
+                return None
+            
+        except Exception as e:
+            logger.error(f"AI Analyst signal error: {e}")
+            return None
 
 analyst = GeraldSniperAnalyst()

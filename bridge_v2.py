@@ -146,6 +146,14 @@ class GeraldBridgeV2:
                             asyncio.create_task(self.handle_message(text))
                     else:
                         logger.warning(f"Unauthorized TG access from {cid}")
+                        
+                elif "callback_query" in update:
+                    cb = update["callback_query"]
+                    cid = cb.get("message", {}).get("chat", {}).get("id")
+                    if cid == self.chat_id:
+                        asyncio.create_task(self._handle_callback(cb))
+                    else:
+                        logger.warning(f"Unauthorized TG callback from {cid}")
         except Exception as e:
             self._consecutive_errors += 1
             backoff = min(60, 5 * self._consecutive_errors)
@@ -218,6 +226,61 @@ class GeraldBridgeV2:
             )
         except Exception as e:
             logger.error(f"Sniper command error: {e}")
+
+    async def _handle_callback(self, cb: dict):
+        try:
+            cb_id = cb["id"]
+            data = cb.get("data", "")
+            message = cb.get("message", {})
+            chat_id = message.get("chat", {}).get("id")
+            
+            # 1. Answer callback
+            url = f"https://api.telegram.org/bot{self.token}/answerCallbackQuery"
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: requests.post(url, json={"callback_query_id": cb_id}, timeout=10))
+
+            if data.startswith(("/take_", "/skip_")):
+                parts = data.split("_", 1)
+                if len(parts) == 2:
+                    action = parts[0]
+                    alert_id = int(parts[1])
+                    result = "TAKEN" if action == "/take" else "SKIPPED"
+                    
+                    # Update DB
+                    import sys as _sys
+                    sniper_path = os.path.join(BASE_DIR, "skills", "gerald-sniper")
+                    if sniper_path not in _sys.path:
+                        _sys.path.insert(0, sniper_path)
+                    from data.database import DatabaseManager
+                    
+                    db_path = os.path.join(sniper_path, "data_run", "sniper.db")
+                    db = DatabaseManager(db_path)
+                    await db.initialize()
+                    await db.update_alert_result(alert_id, result, 0.0, "User interaction via button")
+
+                    # Remove inline keyboard
+                    import json as _json
+                    edit_url = f"https://api.telegram.org/bot{self.token}/editMessageReplyMarkup"
+                    await loop.run_in_executor(
+                        None, lambda: requests.post(edit_url, json={
+                            "chat_id": chat_id,
+                            "message_id": message.get("message_id"),
+                            "reply_markup": _json.dumps({"inline_keyboard": []})
+                        }, timeout=10)
+                    )
+
+                    # Send confirmation
+                    msg_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+                    emoji = "✅" if result == "TAKEN" else "⏭️"
+                    await loop.run_in_executor(
+                        None, lambda: requests.post(msg_url, json={
+                            "chat_id": chat_id,
+                            "text": f"{emoji} Сигнал #{alert_id} отмечен как {result}.",
+                            "reply_to_message_id": message.get("message_id")
+                        }, timeout=10)
+                    )
+        except Exception as e:
+            logger.error(f"Callback handling error: {e}")
 
     async def handle_message(self, text: str):
         async with self._semaphore:
