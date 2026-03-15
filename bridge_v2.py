@@ -112,12 +112,17 @@ class GeraldBridgeV2:
 
         url = f"https://api.telegram.org/bot{self.token}/getUpdates"
         try:
+            proxies = None
+            proxy_url = os.getenv("PROXY_URL")
+            if proxy_url:
+                proxies = {"http": proxy_url, "https": proxy_url}
+                
             # We use non-blocking request for simplicity or run in executor
             loop = asyncio.get_event_loop()
             resp = await loop.run_in_executor(
                 None,
                 lambda: requests.get(
-                    url, params={"offset": self.offset, "timeout": 20}, timeout=25
+                    url, params={"offset": self.offset, "timeout": 20}, timeout=25, proxies=proxies
                 ),
             )
             updates = resp.json().get("result", [])
@@ -156,8 +161,14 @@ class GeraldBridgeV2:
                         logger.warning(f"Unauthorized TG callback from {cid}")
         except Exception as e:
             self._consecutive_errors += 1
-            backoff = min(60, 5 * self._consecutive_errors)
-            logger.error(f"TG Poll error: {e}. Backing off for {backoff}s...")
+            backoff = min(15, 3 * self._consecutive_errors) # Reduced max backoff for standard network drops
+            
+            error_msg = str(e)
+            silent_errors = ["Max retries exceeded", "Read timed out", "Connection aborted", "10054", "502 Bad Gateway", "SSLEOFError"]
+            if any(term in error_msg for term in silent_errors):
+                logger.warning(f"🛜 TG Poll network lag/proxy drop. Retry in {backoff}s...")
+            else:
+                logger.error(f"TG Poll error: {e}. Backing off for {backoff}s...")
             await asyncio.sleep(backoff)
 
     async def _handle_sniper_command(self, text: str):
@@ -177,9 +188,43 @@ class GeraldBridgeV2:
             cmd = parts[0].lower()
 
             if cmd == "/stats":
+                # 1. History Stats
                 stats = await db.get_alert_stats(days=30)
-                import json as _json
-                reply = f"📊 Stats (30d):\n{_json.dumps(stats, ensure_ascii=False, indent=2)}"
+                
+                # 2. Open Positions
+                import aiosqlite
+                async with aiosqlite.connect(db_path) as conn:
+                    conn.row_factory = aiosqlite.Row
+                    cur = await conn.execute(
+                        "SELECT symbol, direction, entry_price, timestamp FROM alerts WHERE result IS NULL ORDER BY timestamp DESC"
+                    )
+                    open_rows = await cur.fetchall()
+
+                # 3. Format Response
+                wr = stats.get('win_rate_pct')
+                wr_str = f"{wr}%" if wr is not None else "N/A"
+                
+                reply = "📊 <b>GERALD SNIPER STATS (30d)</b>\n\n"
+                reply += f"📉 Total Alerts: <b>{stats['total_alerts']}</b>\n"
+                reply += f"🎯 Win Rate: <b>{wr_str}</b> ({stats['evaluated_trades']} trades)\n"
+                
+                res_str = ""
+                for r, d in stats.get('results_breakdown', {}).items():
+                    res_str += f"  • {r}: {d['count']} (avg {d['avg_pnl']}%)\n"
+                if res_str: reply += res_str
+                
+                reply += f"\n📂 <b>Open Positions ({len(open_rows)}):</b>\n"
+                if not open_rows:
+                    reply += "  <i>No active positions</i>\n"
+                else:
+                    # Show only last 10 for brevity if too many
+                    for row in open_rows[:15]:
+                        dt = row['timestamp'][11:16] # HH:MM
+                        reply += f"  • <code>{row['symbol']}</code> {row['direction']} @ {row['entry_price']} ({dt})\n"
+                    if len(open_rows) > 15:
+                        reply += f"  ... and {len(open_rows)-15} more\n"
+                
+                reply += f"\n<i>System Status: Operational 🟢</i>"
 
             elif cmd == "/report":
                 reply = await db.get_weekly_summary()
@@ -220,9 +265,14 @@ class GeraldBridgeV2:
 
             # Send reply
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            proxies = None
+            proxy_url = os.getenv("PROXY_URL")
+            if proxy_url:
+                proxies = {"http": proxy_url, "https": proxy_url}
+                
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
-                None, lambda: requests.post(url, json={"chat_id": self.chat_id, "text": reply}, timeout=10)
+                None, lambda: requests.post(url, json={"chat_id": self.chat_id, "text": reply, "parse_mode": "HTML"}, timeout=10, proxies=proxies)
             )
         except Exception as e:
             logger.error(f"Sniper command error: {e}")
@@ -236,8 +286,13 @@ class GeraldBridgeV2:
             
             # 1. Answer callback
             url = f"https://api.telegram.org/bot{self.token}/answerCallbackQuery"
+            proxies = None
+            proxy_url = os.getenv("PROXY_URL")
+            if proxy_url:
+                proxies = {"http": proxy_url, "https": proxy_url}
+                
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: requests.post(url, json={"callback_query_id": cb_id}, timeout=10))
+            await loop.run_in_executor(None, lambda: requests.post(url, json={"callback_query_id": cb_id}, timeout=10, proxies=proxies))
 
             if data.startswith(("/take_", "/skip_")):
                 parts = data.split("_", 1)
@@ -266,7 +321,7 @@ class GeraldBridgeV2:
                             "chat_id": chat_id,
                             "message_id": message.get("message_id"),
                             "reply_markup": _json.dumps({"inline_keyboard": []})
-                        }, timeout=10)
+                        }, timeout=10, proxies=proxies)
                     )
 
                     # Send confirmation
@@ -277,7 +332,7 @@ class GeraldBridgeV2:
                             "chat_id": chat_id,
                             "text": f"{emoji} Сигнал #{alert_id} отмечен как {result}.",
                             "reply_to_message_id": message.get("message_id")
-                        }, timeout=10)
+                        }, timeout=10, proxies=proxies)
                     )
         except Exception as e:
             logger.error(f"Callback handling error: {e}")
@@ -285,6 +340,11 @@ class GeraldBridgeV2:
     async def handle_message(self, text: str):
         async with self._semaphore:
             try:
+                proxies = None
+                proxy_url = os.getenv("PROXY_URL")
+                if proxy_url:
+                    proxies = {"http": proxy_url, "https": proxy_url}
+
                 # Send typing indicator (non-blocking)
                 typing_url = f"https://api.telegram.org/bot{self.token}/sendChatAction"
                 loop = asyncio.get_event_loop()
@@ -294,6 +354,7 @@ class GeraldBridgeV2:
                         typing_url,
                         json={"chat_id": self.chat_id, "action": "typing"},
                         timeout=5,
+                        proxies=proxies,
                     ),
                 )
 
@@ -309,7 +370,7 @@ class GeraldBridgeV2:
 
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
-                    None, lambda: requests.post(url, json=payload, timeout=10)
+                    None, lambda: requests.post(url, json=payload, timeout=10, proxies=proxies)
                 )
                 logger.info("Response sent to Telegram")
             except Exception as e:
