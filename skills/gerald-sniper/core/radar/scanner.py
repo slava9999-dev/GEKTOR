@@ -15,6 +15,7 @@ from .momentum import calculate_momentum_pct, score_momentum
 from .volatility import calculate_atr_ratio, score_volatility_expansion
 from .scoring import compute_final_radar_score
 from collections import deque
+from utils.math_utils import log_throttler
 
 class RadarScorer:
     """Stabilizes radar scores using historical percentiles (Rule 2.1)"""
