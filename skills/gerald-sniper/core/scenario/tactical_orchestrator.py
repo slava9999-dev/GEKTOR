@@ -93,10 +93,19 @@ class TacticalOrchestrator:
         self.invalidate_signals_for_symbol(symbol)
 
     def invalidate_signals_for_symbol(self, symbol: str):
-        """Marks all pending signals for a symbol as REJECTED."""
+        """Marks pending signals as REJECTED. Optimization: Allow EVALUATING to continue."""
         for sig in list(self.active_signals.values()):
-            if sig.symbol == symbol and sig.state in [SignalState.DETECTED, SignalState.EVALUATING]:
-                sig.transition_to(SignalState.REJECTED, "Symbol removed from watchlist")
+            if sig.symbol == symbol:
+                if sig.state == SignalState.EVALUATING:
+                    logger.debug(f"🛡️ [Orchestrator] {symbol} removed from watchlist but EVALUATING signal allowed to finish.")
+                    continue
+                if sig.state == SignalState.DETECTED:
+                    sig.transition_to(SignalState.REJECTED, "Symbol removed from watchlist")
+
+    def get_active_signal_symbols(self) -> set[str]:
+        """Returns set of symbols currently being evaluated or held."""
+        return {sig.symbol for sig in self.active_signals.values() 
+                if sig.state in [SignalState.EVALUATING, SignalState.APPROVED, SignalState.POSITION_OPEN]}
 
     async def handle_detector_event(self, event: DetectorEvent):
         """Bus handler for detector triggers."""
@@ -247,25 +256,33 @@ class TacticalOrchestrator:
         if getattr(signal, "btc_trend_1h", "FLAT") == "FLAT":
             signal.btc_trend_1h = self._btc_context
             
-        # BTC Alignment Early Check
-        if signal.direction == "SHORT" and "UP" in str(signal.btc_trend_1h).upper():
-            logger.info(f"🚫 [Orchestrator] BTC Early Rejection: {signal.symbol} SHORT vs BTC {signal.btc_trend_1h}")
-            signal.transition_to(SignalState.REJECTED, f"BTC Trend mismatch: {signal.btc_trend_1h} vs SHORT")
-            return
-            
-        if signal.direction == "LONG" and "DOWN" in str(signal.btc_trend_1h).upper():
-            logger.info(f"🚫 [Orchestrator] BTC Early Rejection: {signal.symbol} LONG vs BTC {signal.btc_trend_1h}")
-            signal.transition_to(SignalState.REJECTED, f"BTC Trend mismatch: {signal.btc_trend_1h} vs LONG")
-            return
+        # v5.1: MarketSentiment replaces fragmented BTC checks
+        from core.realtime.sentiment import market_sentiment
+        sentiment_modifier = market_sentiment.confidence_modifier(signal.direction)
+        signal._sentiment_modifier = sentiment_modifier
+        signal.btc_trend_1h = market_sentiment.get_trend_string()  # Keep backward compat
+        
+        # Log only when sentiment has meaningful impact
+        if abs(sentiment_modifier) >= 0.05:
+            logger.info(
+                f"🌡️ [Orchestrator] Sentiment: {market_sentiment.score:+d} ({market_sentiment.label}) | "
+                f"{signal.symbol} {signal.direction} modifier: {sentiment_modifier:+.3f}"
+            )
 
         self.active_signals[signal.id] = signal
         
         # 1. Transition to EVALUATING
         signal.transition_to(SignalState.EVALUATING, "Waiting for confluence...")
         
-        # 2. Accumulation Window (Rule 1.1)
-        # Wait for confluence factors to accumulate
-        window = CONFLUENCE_RULES["accumulation_window_sec"]
+        # 2. Accumulation Window (v5.0: Progressive Timeout)
+        base_window = CONFLUENCE_RULES["accumulation_window_sec"]  # 180s
+        radar = signal.radar_score or 0
+        if radar > 80:
+            window = 240  # High-quality radar: give more time
+        elif radar > 60:
+            window = base_window  # Standard: 180s
+        else:
+            window = 120  # Low radar: don't waste time
             
         start_wait = time.time()
         passed_confluence = False
@@ -278,7 +295,6 @@ class TacticalOrchestrator:
 
             passed_confluence, conf_score, reason = SignalAccumulator.evaluate_confluence(signal)
             if passed_confluence:
-                logger.info(f"🔥 [Orchestrator] Confluence achieved for {signal.symbol}: {signal.detectors} (Conf: {conf_score:.2f})")
                 break
             await asyncio.sleep(2)
         
@@ -293,6 +309,21 @@ class TacticalOrchestrator:
             await self._save_signal_stats(signal)
             return
 
+        # 2.1 Apply MarketSentiment modifier to confidence (v5.1)
+        sentiment_mod = getattr(signal, '_sentiment_modifier', 0.0)
+        if sentiment_mod != 0.0:
+            original = conf_score
+            conf_score = round(conf_score + sentiment_mod, 2)
+            direction_label = "boost" if sentiment_mod > 0 else "penalty"
+            logger.info(f"🌡️ [Orchestrator] Sentiment {direction_label} for {signal.symbol} {signal.direction}: {original:.2f} → {conf_score:.2f} ({sentiment_mod:+.3f})")
+            if conf_score < CONFLUENCE_RULES["min_confidence"]:
+                signal.transition_to(SignalState.REJECTED, f"Sentiment dropped confidence: {conf_score:.2f} < {CONFLUENCE_RULES['min_confidence']}")
+                await self._save_signal_stats(signal)
+                return
+        
+        signal.confidence_score = conf_score  # FIX T-FATAL: Populate attribute
+        logger.info(f"🔥 [Orchestrator] Confluence achieved for {signal.symbol}: {signal.detectors} (Conf: {conf_score:.2f})")
+
         logger.info(f"🧠 [Orchestrator] Final Evaluation for {signal.symbol} | Detectors: {signal.detectors} | Dist: {signal.level_distance_pct}% | BTC: {signal.btc_trend_1h}")
         
         # 2a. Regime Filter (Roadmap Step 3)
@@ -304,15 +335,28 @@ class TacticalOrchestrator:
             # Rule 3.1: Alignment check
             if regime == MarketRegime.TREND_UP and signal.direction == "SHORT":
                 signal.transition_to(SignalState.REJECTED, "Regime Conflict: SHORT vs TREND_UP")
+                await self._save_signal_stats(signal)
                 return
             if regime == MarketRegime.TREND_DOWN and signal.direction == "LONG":
                 signal.transition_to(SignalState.REJECTED, "Regime Conflict: LONG vs TREND_DOWN")
+                await self._save_signal_stats(signal)
                 return
             
-            # Rule 3.2: Range penalty
-            if regime == MarketRegime.RANGE and conf_score < 0.75:
-                 signal.transition_to(SignalState.REJECTED, f"Range Market: Confidence {conf_score:.2f} < 0.75")
-                 return
+            # Rule 3.2: Dynamic Range Threshold (v5.0)
+            # Higher volatility = lower threshold (more signals in volatile range)
+            if regime == MarketRegime.RANGE:
+                vol_60s = state.get_volatility(60) if state else 0
+                if vol_60s > 0.5:
+                    range_threshold = 0.60  # High vol range = permissive
+                elif vol_60s > 0.3:
+                    range_threshold = 0.65  # Medium vol
+                else:
+                    range_threshold = 0.70  # Low vol = stricter
+                    
+                if conf_score < range_threshold:
+                    signal.transition_to(SignalState.REJECTED, f"Range Market: Confidence {conf_score:.2f} < {range_threshold} (vol: {vol_60s:.2f})")
+                    await self._save_signal_stats(signal)
+                    return
         
         # 2b. Decision Engine (FEAT-002)
         if not self.decision_engine:
@@ -364,6 +408,17 @@ class TacticalOrchestrator:
             detectors=",".join(signal.detectors),
             rejection_reason=signal.rejection_reason,
         )
+        # v5.0: Publish rejection event for metrics tracking
+        if signal.state == SignalState.REJECTED and signal.rejection_reason:
+            try:
+                from core.metrics.metrics import RejectionEvent
+                asyncio.create_task(bus.publish(RejectionEvent(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    reason=signal.rejection_reason
+                )))
+            except Exception:
+                pass
 
     async def cleanup_loop(self):
         """Periodically removes old signals from memory."""

@@ -2,7 +2,7 @@ from core.radar import CoinRadarMetrics
 from utils.safe_math import safe_float
 
 def calculate_final_score(
-    radar: CoinRadarMetrics,
+    radar, # Could be CoinRadarMetrics or RadarV2Metrics
     level: dict,
     trigger: dict,
     btc_ctx: dict,
@@ -25,24 +25,23 @@ def calculate_final_score(
     # Модификатор по источнику уровня (V4.0)
     source = str(level.get('source', 'KDE'))
     
-    # Для динамических уровней жесткое кол-во касаний не имеет такого значения как у KDE
+    # Для динамических уровней ограничиваем халявные касания
     if 'WEEK_EXTREME' in source:
-        # Даём базовый балл эквивалентный ~4 касаниям
-        effective_touches = max(4.0, safe_float(level['touches']))
-        source_multiplier = 0.85   # 85% — сильный уровень, но без кластеризации
+        effective_touches = safe_float(level.get('touches', 1))
+        source_multiplier = 0.85   # 85% — сильный экстрим, но не кластерный KDE
     elif 'ROUND_NUMBER' in source:
-        # Базовый балл эквивалентный ~3 касаниям
-        effective_touches = max(3.0, safe_float(level['touches']))
-        source_multiplier = 0.7    # 70% — психологический, может не сработать
+        # ROUND_NUMBER (V4.2): Allow them to be useful but not dominant
+        effective_touches = 1.5 
+        source_multiplier = 0.6 # Reduced penalty (was 0.4)
     else:
-        # Обычный KDE
-        effective_touches = safe_float(level['touches'])
-        source_multiplier = 1.0 if ('KDE' in source and '+' not in source) else 0.8
+        # Standard KDE (V4.2)
+        effective_touches = safe_float(level.get('touches', 1))
+        source_multiplier = 1.0
         
-    # Бонус если KDE + динамический совпали (сильный сигнал)
-    if '+' in source:
-        effective_touches = max(5.0, safe_float(level['touches'])) # Гарантированно высокая оценка касаний
-        source_multiplier = 1.15   # 115% — подтверждённый двумя методами
+    # Bonus for Confluence (Multi-Source or Cluster)
+    if '+' in source or level.get('confluence_score', 0) >= 2:
+        effective_touches = max(4.0, effective_touches) # Floor for clusters
+        source_multiplier = 1.25   # 125% — Verified Cluster
 
     import math
     # Логарифмическая шкала решает проблему насыщения скоринга.
@@ -54,8 +53,12 @@ def calculate_final_score(
     breakdown['level'] = round(base_level_score * source_multiplier, 1)
     
     # --- B. Fuel: Volume + OI ---
-    rvol_score = min(radar.rvol / 5.0, 1.0) * (w_fuel * 0.5)
-    oi_score = min(radar.delta_oi_4h_pct / 20.0, 1.0) * (w_fuel * 0.5)
+    # Radar v2 uses volume_spike as rvol. delta_oi is currently 0 in v2.
+    current_rvol = getattr(radar, 'rvol', getattr(radar, 'volume_spike', 1.0))
+    current_oi = getattr(radar, 'delta_oi_4h_pct', 0.0)
+    
+    rvol_score = min(current_rvol / 5.0, 1.0) * (w_fuel * 0.5)
+    oi_score = min(current_oi / 20.0, 1.0) * (w_fuel * 0.5)
     breakdown['fuel'] = round(rvol_score + oi_score, 1)
     
     # --- C. Pattern Quality ---
@@ -78,16 +81,35 @@ def calculate_final_score(
         direction = 'LONG' if 'LONG' in trigger['pattern'] or level['type'] == 'RESISTANCE' else 'SHORT'
     
     macro_adj = 0
-    if direction == 'LONG':
-        if btc_ctx.get('trend') in ('STRONG_DOWN', 'DOWN'):
-            macro_adj = -w_macro
-        elif btc_ctx.get('trend') == 'STRONG_UP':
-            macro_adj = w_macro * 0.7
-    elif direction == 'SHORT':
-        if btc_ctx.get('trend') in ('STRONG_UP', 'UP'):
-            macro_adj = -w_macro
-        elif btc_ctx.get('trend') == 'STRONG_DOWN':
-            macro_adj = w_macro * 0.7
+    # v5.1: Use centralized MarketSentiment for macro adjustment
+    try:
+        from core.realtime.sentiment import market_sentiment
+        if not market_sentiment.is_stale:
+            macro_adj = market_sentiment.macro_score_adjustment(direction, max_points=w_macro)
+        else:
+            # Fallback to old logic if sentiment data is stale
+            if direction == 'LONG':
+                if btc_ctx.get('trend') in ('STRONG_DOWN', 'DOWN'):
+                    macro_adj = -w_macro
+                elif btc_ctx.get('trend') == 'STRONG_UP':
+                    macro_adj = w_macro * 0.7
+            elif direction == 'SHORT':
+                if btc_ctx.get('trend') in ('STRONG_UP', 'UP'):
+                    macro_adj = -w_macro
+                elif btc_ctx.get('trend') == 'STRONG_DOWN':
+                    macro_adj = w_macro * 0.7
+    except ImportError:
+        # Fallback if module not available
+        if direction == 'LONG':
+            if btc_ctx.get('trend') in ('STRONG_DOWN', 'DOWN'):
+                macro_adj = -w_macro
+            elif btc_ctx.get('trend') == 'STRONG_UP':
+                macro_adj = w_macro * 0.7
+        elif direction == 'SHORT':
+            if btc_ctx.get('trend') in ('STRONG_UP', 'UP'):
+                macro_adj = -w_macro
+            elif btc_ctx.get('trend') == 'STRONG_DOWN':
+                macro_adj = w_macro * 0.7
             
     breakdown['macro'] = round(macro_adj, 1)
     
@@ -106,6 +128,13 @@ def calculate_final_score(
     # Stale level penalty
     if level.get('stale', False):
         mods_total += modifiers.get('stale_level_penalty', -10)
+        
+    # Level Age adjustments
+    age = level.get('age', 1)
+    if age < 3: # younger than 15 mins
+        mods_total += modifiers.get('young_level_penalty', -10)
+    elif age > 6: # older than 30 mins
+        mods_total += modifiers.get('mature_level_bonus', 5)
         
     # Liquidation bonus
     if trigger.get('liquidation_cascade'):
