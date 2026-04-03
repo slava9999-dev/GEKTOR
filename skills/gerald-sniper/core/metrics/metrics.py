@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from loguru import logger
 from collections import defaultdict
-from core.events.event_bus import bus
+from core.events.nerve_center import bus
 from core.events.events import DetectorEvent, SignalEvent, ExecutionEvent, BaseEvent
 
 @dataclass

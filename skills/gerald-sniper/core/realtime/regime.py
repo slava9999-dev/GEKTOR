@@ -17,33 +17,40 @@ class RegimeClassifier:
     """
     
     @staticmethod
-    def classify(state: SymbolLiveState, btc_trend: str = "FLAT") -> MarketRegime:
+    def classify(state: SymbolLiveState, btc_trend: str = "FLAT", 
+                 atr_5m: float = None, atr_sma: float = None) -> MarketRegime:
+        """
+        Dynamic Microstructure Regime Classification (Task 4.2).
+        Eliminates static 0.4% hardcode in favor of ATR-normalized bands.
+        """
         try:
-            # 1. Volatility check (60s window)
-            vol = state.get_volatility(60)
-            if vol > 1.2: # Increased threshold for expansion
+            price = state.current_price
+            m5_ma = state.get_moving_average(300) # 5min MA
+            
+            # 1. VOLATILITY EXPANSION (Task 4.2: VOL_UP logic)
+            # If current ATR spike is > 50% above its 14-period average
+            if atr_5m and atr_sma and atr_5m > (atr_sma * 1.5):
                 return MarketRegime.VOLATILITY_EXPANSION
 
-            # 2. Trend check (300s window)
-            m5_ma = state.get_moving_average(300)
-            dist_pct = ((state.current_price - m5_ma) / m5_ma) * 100 if m5_ma > 0 else 0
-            
-            # Factor in BTC momentum (Roadmap Stage 3 Enhancement)
-            btc_up = "UP" in btc_trend.upper()
-            btc_down = "DOWN" in btc_trend.upper()
+            # Fallback to standard price deviation if ATR is missing
+            if not atr_5m or m5_ma <= 0:
+                dist_pct = ((price - m5_ma) / m5_ma) * 100 if m5_ma > 0 else 0
+                if dist_pct > 0.4: return MarketRegime.TREND_UP
+                if dist_pct < -0.4: return MarketRegime.TREND_DOWN
+                return MarketRegime.RANGE
 
-            if dist_pct > 0.4:
-                # If coin is UP but BTC is crashing, it's likely a fakeout or high volatility
-                if btc_down and dist_pct < 1.0:
-                    return MarketRegime.VOLATILITY_EXPANSION
+            # 2. DYNAMIC TREND BANDS (Rule: MA +/- 1.2 * ATR)
+            upper_band = m5_ma + (atr_5m * 1.2)
+            lower_band = m5_ma - (atr_5m * 1.2)
+
+            if price > upper_band:
                 return MarketRegime.TREND_UP
-            elif dist_pct < -0.4:
-                # If coin is DOWN but BTC is mooning, it might be a temporary dip
-                if btc_up and dist_pct > -1.0:
-                    return MarketRegime.RANGE
+            elif price < lower_band:
                 return MarketRegime.TREND_DOWN
-                
+            
+            # 3. RANGE (Price within volatility-adjusted channel)
             return MarketRegime.RANGE
+
         except Exception as e:
-            logger.error(f"Regime classification error: {e}")
+            logger.error(f"❌ [Regime] Classification failure: {repr(e)}")
             return MarketRegime.UNKNOWN

@@ -1,271 +1,350 @@
-import aiohttp
 import asyncio
+import hashlib
+import os
+import random
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from loguru import logger
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import aiohttp
+import orjson
+from utils.math_utils import log_throttler
+
+
+@dataclass
+class EndpointCBState:
+    """Per-endpoint circuit breaker state."""
+    name: str
+    failures: int = 0
+    open: bool = False
+    open_until: float = 0.0
+    cooldown: float = 30.0
+    max_cooldown: float = 300.0
+    threshold: int = 3
+
+    def record_failure(self, error_msg: str):
+        self.failures += 1
+        if self.failures >= self.threshold:
+            if not self.open:
+                self.open = True
+                self.cooldown = 30.0 # Initial 30s
+            else:
+                self.cooldown = min(300.0, self.cooldown * 2.0) # Exponential
+                
+            self.open_until = time.monotonic() + self.cooldown
+            logger.warning(
+                f"🔴 CB [{self.name}] OPEN — {self.failures} failures. "
+                f"Retry in {self.cooldown:.0f}s. Last: {error_msg[:80]}"
+            )
+
+    def record_success(self):
+        if self.failures > 0 or self.open:
+            logger.info(f"🟢 CB [{self.name}] RECOVERED")
+        self.failures = 0
+        self.open = False
+        self.cooldown = 30.0
+
+    @property
+    def is_available(self) -> bool:
+        if not self.open:
+            return True
+        if time.monotonic() >= self.open_until:
+            return True  # half-open
+        return False
 
 
 class BybitREST:
     """
-    Bybit REST API v5 клиент.
-    Обрабатывает rate limits, ретраи, и реализует circuit breaker
-    с автопереключением на fallback URL при потере связи.
+    Gerald v5 — Bybit REST API v5 client refactored for aiohttp (Audit 25.1).
+    
+    Architecture:
+    - aiohttp-based high-concurrency engine
+    - Per-endpoint circuit breakers
+    - Strict Semaphore(15) for Rate Limit protection
+    - Sliding window request budget (3000/min)
+    - Jittered exponential backoff
     """
 
-    # Circuit breaker пороги
-    CB_FAILURE_THRESHOLD = 3       # последовательных ошибок до активации
-    CB_INITIAL_COOLDOWN = 30       # секунд до первой повторной попытки
-    CB_MAX_COOLDOWN = 300          # максимальный кулдаун (5 минут)
-    CB_COOLDOWN_MULTIPLIER = 2     # множитель экспоненциального бэкоффа
-
-    def __init__(self, base_url: str = "https://api.bybit.com",
-                 fallback_url: str = "https://api.bytick.com"):
+    MAX_REQUESTS_PER_MIN = 3000
+    SEMAPHORE_LIMIT = 15 # Gektor's Guard: Lower concurrency to avoid 429
+    
+    # [GEKTOR v8.2] Granular Timeout Matrix — Anti Half-Open Sockets
+    # total:        Hard ceiling for the entire operation (request + response read)
+    # sock_connect: TCP handshake timeout (detects unreachable proxy/host)
+    # sock_read:    Time to wait for next chunk of response data
+    #               This is the PRIMARY defense against Half-Open sockets:
+    #               if the remote closes its end, our read() hangs forever.
+    #               With sock_read=8s, Python raises TimeoutError after 8s of silence.
+    # connect:      Total connection setup including SSL handshake
+    REQUEST_TIMEOUT_TOTAL = 15  # Hard ceiling (seconds)
+    REQUEST_TIMEOUT_SOCK_CONNECT = 5  # TCP SYN → ACK (seconds)
+    REQUEST_TIMEOUT_SOCK_READ = 8  # Response chunk silence limit (seconds)
+    REQUEST_TIMEOUT_CONNECT = 5  # Connection + SSL setup (seconds)
+    
+    # Session recycling: Force-close and recreate session every N seconds
+    # This proactively kills any TCP connections that may have gone Half-Open
+    # due to proxy IP rotation, NAT table flush, or link flaps.
+    SESSION_RECYCLE_INTERVAL = 1800  # 30 minutes
+    
+    def __init__(
+        self,
+        base_url: str = "https://api.bybit.com",
+        fallback_url: str = "https://api.bytick.com",
+        is_execution: bool = False,
+        proxy_url: Optional[str] = None
+    ):
         self.primary_url = base_url
         self.fallback_url = fallback_url
-        self.session = None
+        self.is_execution = is_execution
+        self.proxy_url = proxy_url
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._lock = asyncio.Lock()
 
-        # Circuit breaker состояние
-        self._consecutive_failures = 0
+        # Circuit breaker state
+        self._endpoint_cbs: Dict[str, EndpointCBState] = {}
         self._circuit_open = False
         self._circuit_open_until = 0.0
-        self._current_cooldown = self.CB_INITIAL_COOLDOWN
-        self._last_error_msg = ""
-
-        # Fallback состояние
+        self._consecutive_failures = 0
+        self._current_cooldown = 30.0 if not self.is_execution else 5.0
+        
+        # Concurrency & Budget
+        self._rate_semaphore = asyncio.Semaphore(self.SEMAPHORE_LIMIT)
+        self._request_timestamps: deque = deque(maxlen=self.MAX_REQUESTS_PER_MIN)
+        self._inflight: Dict[str, asyncio.Future] = {}
+        self._inflight_lock = asyncio.Lock()
+        
+        # Fallback switching
         self._using_fallback = False
         self._primary_fail_streak = 0
-        self._fallback_switch_threshold = 3     # После 3 провалов — переключиться
+        self._fallback_switch_threshold = 2 if self.is_execution else 3
         self._last_primary_check = 0.0
-        self._primary_recheck_interval = 600    # Каждые 10 мин пробовать primary
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        now = time.monotonic()
         
-        self._rate_semaphore = asyncio.Semaphore(7)  # Выше concurrency для 120 тикеров
-        self._rate_delay = 0.2  # 200ms между запросами (чтобы не душить API)
-        self._max_rate_delay = 5.0
-        self._min_rate_delay = 0.1
-
-    @property
-    def _active_url(self) -> str:
-        """Текущий активный базовый URL."""
-        return self.fallback_url if self._using_fallback else self.primary_url
-
-    @property
-    def is_healthy(self) -> bool:
-        """True если клиент считает API доступным."""
-        if not self._circuit_open:
-            return True
-        return time.monotonic() >= self._circuit_open_until
-
-    async def _get_session(self):
+        # [GEKTOR v8.2] Session Recycling — proactively kill stale TCP pools
+        if self.session and not self.session.closed:
+            if hasattr(self, '_session_created_at') and (now - self._session_created_at) > self.SESSION_RECYCLE_INTERVAL:
+                logger.info("🔄 [TCP] Session recycling — closing stale connection pool.")
+                try:
+                    await self.session.close()
+                except Exception:
+                    pass
+                self.session = None
+        
         if self.session is None or self.session.closed:
-            # Увеличенный таймаут сессии для предотвращения отвалов на плохом коннекте
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            self.session = aiohttp.ClientSession(timeout=timeout)
+            async with self._lock:
+                if self.session is None or self.session.closed:
+                    # Determine appropriate proxy
+                    proxy = self.proxy_url or os.getenv("PROXY_OMS" if self.is_execution else "PROXY_RADAR")
+                    
+                    # [GEKTOR v8.2] TCP Connector with Keepalive Probes
+                    # enable_cleanup_closed: Detect and cleanup closed connections
+                    # keepalive_timeout: How long to keep idle connections alive (30s)
+                    # force_close=False: Reuse connections (HTTP/1.1 keep-alive)
+                    conn = aiohttp.TCPConnector(
+                        limit=50, 
+                        use_dns_cache=True, 
+                        force_close=False,
+                        enable_cleanup_closed=True,
+                        keepalive_timeout=30,  # Close idle connections after 30s
+                        ttl_dns_cache=300,     # Refresh DNS every 5 min (proxy IP rotation)
+                    )
+                    
+                    # [GEKTOR v8.2] Granular timeouts — anti Half-Open socket matrix
+                    timeout = aiohttp.ClientTimeout(
+                        total=self.REQUEST_TIMEOUT_TOTAL,
+                        connect=self.REQUEST_TIMEOUT_CONNECT,
+                        sock_connect=self.REQUEST_TIMEOUT_SOCK_CONNECT,
+                        sock_read=self.REQUEST_TIMEOUT_SOCK_READ,
+                    )
+                    
+                    self.session = aiohttp.ClientSession(
+                        connector=conn, 
+                        timeout=timeout,
+                        json_serialize=orjson.dumps
+                    )
+                    self._session_created_at = now
+                    if proxy:
+                        logger.info(f"🛡️ BybitREST [{'OMS' if self.is_execution else 'Radar'}] initiated via proxy: {proxy}")
         return self.session
 
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
 
-    def _record_success(self):
-        """Сброс circuit breaker и fallback при успешном запросе."""
-        if self._consecutive_failures > 0 or self._circuit_open:
-            logger.info(f"🟢 Bybit API connection restored via {self._active_url}")
-        self._consecutive_failures = 0
-        self._circuit_open = False
-        self._current_cooldown = self.CB_INITIAL_COOLDOWN
-        self._last_error_msg = ""
-        # Успех на primary → сброс fallback счётчика
-        if not self._using_fallback:
-            self._primary_fail_streak = 0
+    def _get_endpoint_key(self, endpoint: str) -> str:
+        if "tickers" in endpoint: return "tickers"
+        if "kline" in endpoint: return "kline"
+        if "recent-trade" in endpoint: return "recent-trade"
+        return "other"
 
-    def _record_failure(self, error_msg: str):
-        """Трекинг ошибок и активация circuit breaker."""
-        self._consecutive_failures += 1
-        self._last_error_msg = error_msg
+    def _get_endpoint_cb(self, endpoint: str) -> EndpointCBState:
+        key = self._get_endpoint_key(endpoint)
+        if key not in self._endpoint_cbs:
+            self._endpoint_cbs[key] = EndpointCBState(name=key)
+        return self._endpoint_cbs[key]
 
-        if self._consecutive_failures >= self.CB_FAILURE_THRESHOLD:
-            # Если circuit был закрыт (или мы в режиме half-open и снова упали)
-            if not self._circuit_open or time.monotonic() >= self._circuit_open_until:
-                self._circuit_open = True
-                self._circuit_open_until = time.monotonic() + self._current_cooldown
-                logger.warning(
-                    f"🔴 Circuit breaker OPEN — {self._consecutive_failures} consecutive failures. "
-                    f"Last error: {error_msg}. "
-                    f"Will retry in {self._current_cooldown}s."
-                )
-                self._current_cooldown = min(
-                    self._current_cooldown * self.CB_COOLDOWN_MULTIPLIER,
-                    self.CB_MAX_COOLDOWN,
-                )
-
-    def _switch_to_fallback(self):
-        """Переключение на fallback URL."""
-        if not self._using_fallback and self.fallback_url:
-            self._using_fallback = True
-            self._primary_fail_streak = 0
-            # Сброс circuit breaker при переключении — даём шанс fallback
-            self._circuit_open = False
-            self._consecutive_failures = 0
-            self._current_cooldown = self.CB_INITIAL_COOLDOWN
-            logger.warning(f"🔄 Switching REST to fallback: {self.fallback_url}")
-
-    def _switch_to_primary(self):
-        """Возврат на primary URL."""
-        if self._using_fallback:
-            self._using_fallback = False
-            self._primary_fail_streak = 0
-            logger.info(f"🔄 Switched back to primary REST: {self.primary_url}")
-
-    async def _try_primary_probe(self, endpoint: str, params: Dict = None):
-        """Периодическая проверка primary URL, если сидим на fallback."""
-        if not self._using_fallback:
-            return
-
+    async def _check_budget(self):
         now = time.monotonic()
-        if now - self._last_primary_check < self._primary_recheck_interval:
-            return
+        while self._request_timestamps and (now - self._request_timestamps[0]) > 60:
+            self._request_timestamps.popleft()
+        
+        if len(self._request_timestamps) >= self.MAX_REQUESTS_PER_MIN:
+            wait = 60.1 - (now - self._request_timestamps[0])
+            if wait > 0:
+                if log_throttler.should_log("rest_budget_hit", 30):
+                    logger.warning(f"⏳ Budget hit ({self.MAX_REQUESTS_PER_MIN}/min). Pausing {wait:.1f}s.")
+                await asyncio.sleep(wait)
+        self._request_timestamps.append(now)
 
-        self._last_primary_check = now
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Dict = None,
+        retries: int = 3,
+        headers: Dict = None,
+    ) -> Dict:
+        """Coalesced request with aiohttp (Audit 25.1)."""
+        # 1. Coalescing (Zero Duplication)
+        coal_key = f"{endpoint}|{sorted(params.items()) if params else ''}"
+        async with self._inflight_lock:
+            if coal_key in self._inflight:
+                return await asyncio.shield(self._inflight[coal_key])
+            
+            future = asyncio.get_event_loop().create_future()
+            self._inflight[coal_key] = future
+
         try:
-            session = await self._get_session()
-            test_url = f"{self.primary_url}{endpoint}"
-            async with session.request("GET", test_url, params=params,
-                                       timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("retCode") == 0:
-                        self._switch_to_primary()
-        except Exception:
-            pass  # Остаёмся на fallback
+            result = await self._execute_request(method, endpoint, params, retries, headers)
+            if not future.done(): future.set_result(result)
+            return result
+        except Exception as e:
+            if not future.done(): future.set_exception(e)
+            return {"error": str(e)}
+        finally:
+            async with self._inflight_lock:
+                self._inflight.pop(coal_key, None)
 
-    async def _request(self, method: str, endpoint: str, params: Dict = None, retries: int = 3) -> Dict:
+    async def _execute_request(self, method: str, endpoint: str, params: Dict, retries: int, headers: Dict) -> Dict:
+        ep_cb = self._get_endpoint_cb(endpoint)
+        if not ep_cb.is_available:
+            return {"error": "CIRCUIT_BREAKER_OPEN"}
+
+        if self._circuit_open and time.monotonic() < self._circuit_open_until:
+            return {"error": "GLOBAL_CB_OPEN"}
+
         async with self._rate_semaphore:
-            await asyncio.sleep(self._rate_delay)
-            # Периодически пробуем вернуться на primary
-            await self._try_primary_probe(endpoint, params)
+            await self._check_budget()
+            session = await self._get_session()
+            base = self.fallback_url if self._using_fallback else self.primary_url
+            url = f"{base}{endpoint}"
+            proxy = os.getenv("PROXY_RADAR" if not self.is_execution else "PROXY_OMS")
 
-        # Circuit breaker проверка
-        if self._circuit_open:
-            now = time.monotonic()
-            if now < self._circuit_open_until:
-                # Если застряли на fallback и он тоже мёртв — пробуем primary
-                if self._using_fallback and self._consecutive_failures >= self.CB_FAILURE_THRESHOLD:
-                    self._switch_to_primary()
-                    self._circuit_open = False
-                    self._consecutive_failures = 0
-                    self._current_cooldown = self.CB_INITIAL_COOLDOWN
-                    logger.info(f"🔄 Cycling REST back to primary: {self.primary_url}")
-                else:
-                    remaining = int(self._circuit_open_until - now)
-                    logger.debug(
-                        f"Circuit breaker open, skipping {endpoint}. Retry in {remaining}s."
-                    )
-                    return {}
-            logger.info(f"🟡 Circuit breaker half-open — probing {endpoint}...")
-
-        session = await self._get_session()
-        url = f"{self._active_url}{endpoint}"
-
-        for attempt in range(retries):
-            try:
-                # Индивидуальный явный таймаут для запроса
-                req_timeout = aiohttp.ClientTimeout(total=15)
-                async with session.request(method, url, params=params, timeout=req_timeout) as response:
-                    # Rate limit headers check
-                    limit_status = response.headers.get('X-Bapi-Limit-Status')
-                    limit_reset = response.headers.get('X-Bapi-Limit-Reset-Timestamp')
-                    
-                    if limit_status and limit_reset:
-                        try:
-                            limit_left = int(limit_status)
-                            reset_ts = int(limit_reset) / 1000.0
-                            now = time.time()
-                            
-                            if limit_left < 20 and reset_ts > now:
-                                wait_sec = reset_ts - now + 0.1
-                                logger.warning(f"Rate limit low ({limit_left} left). Sleeping for {wait_sec:.2f}s until reset.")
-                                await asyncio.sleep(wait_sec)
-                        except (ValueError, TypeError):
-                            pass
-
-                    if response.status == 200:
-                        data = await response.json()
-                        ret_code = data.get("retCode")
-                        if ret_code == 0:
-                            self._record_success()
-                            # Decrease rate delay gracefully upon success
-                            self._rate_delay = max(self._min_rate_delay, self._rate_delay * 0.95)
-                            return data.get("result", {})
-                        elif ret_code in (10006, 10018) or "Too many visits" in str(data.get("retMsg")):
-                            # Adaptive rate limiter: slow down exponentially if warned
-                            self._rate_delay = min(self._max_rate_delay, self._rate_delay * 2.0)
-                            wait_time = (2 ** attempt) + self._rate_delay
-                            logger.warning(f"Rate limited (retCode {ret_code}) on {url}. Adaptive delay updated to {self._rate_delay:.2f}s. Waiting {wait_time:.2f}s...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            logger.error(f"Bybit API Error: {data.get('retMsg')} for url {url}")
-                            return {}
-                    elif response.status == 429:
-                        self._rate_delay = min(self._max_rate_delay, self._rate_delay * 2.0)
-                        wait_time = (2 ** attempt) + self._rate_delay
-                        logger.warning(f"Rate limited (429) on {url}. Adaptive delay updated to {self._rate_delay:.2f}s. Waiting {wait_time:.2f}s...")
-                        await asyncio.sleep(wait_time)
-                        continue
+            for attempt in range(retries):
+                try:
+                    # aiohttp handles params and json differently:
+                    kwargs = {"headers": headers, "proxy": proxy}
+                    if method.upper() == "GET":
+                        kwargs["params"] = params
                     else:
-                        logger.error(f"HTTP Error {response.status} on {url}")
-                        return {}
+                        kwargs["json"] = params
 
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout on {url}. Attempt {attempt + 1}/{retries}")
-                await asyncio.sleep(1 + attempt)
+                    async with session.request(method, url, **kwargs) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(loads=orjson.loads)
+                            ret_code = data.get("retCode")
+                            if ret_code == 0:
+                                self._consecutive_failures = 0
+                                ep_cb.record_success()
+                                return data.get("result", {})
+                            
+                            # Rate limits 
+                            if ret_code in (10006, 10018):
+                                wait = (2 ** attempt) + random.uniform(0.1, 0.5)
+                                logger.warning(f"⚠️ Rate limited {ret_code} on {endpoint}. Wait {wait:.1f}s")
+                                await asyncio.sleep(wait)
+                                continue
+                            
+                            return data # Explicitly return API error
+                        
+                        elif resp.status == 429:
+                            # [NERVE REPAIR v4.3] Intellectual Backoff
+                            retry_after = float(resp.headers.get("Retry-After", 0.5))
+                            jitter = random.uniform(0.1, 0.4)
+                            wait = retry_after + jitter
+                            logger.warning(f"🛑 [429] Too Many Requests. Retry-After: {retry_after}s. Sleeping {wait:.2f}s (Jitter applied)")
+                            await asyncio.sleep(wait)
+                            # Rotate endpoint on consecutive 429s as implied by GEKTOR
+                            self.rotate_endpoint()
+                            continue
+                        
+                        else:
+                            text = await resp.text()
+                            logger.error(f"❌ HTTP {resp.status} on {endpoint}: {text[:100]}")
+                            ep_cb.record_failure(f"HTTP_{resp.status}")
+                
+                except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError) as e:
+                    # [NERVE REPAIR v4.3] Domain Rotation on Network Failure
+                    logger.error(f"🌐 Connectivity failure on {endpoint} (Attempt {attempt+1}): {e}")
+                    self.rotate_endpoint()
+                    
+                    if attempt == retries - 1 and not self._using_fallback:
+                        # Permanent switch for this process if primary is unreachable
+                        self._using_fallback = True
+                        logger.warning("🔄 Switching permanently to fallback API due to network errors.")
+                except Exception as e:
+                    logger.error(f"💥 Request error sub {endpoint}: {e}")
+                
+                # Exponential Backoff with Jitter for network-level retries
+                wait = min(2.5, (0.5 * (2 ** attempt))) + random.uniform(0.01, 0.1)
+                await asyncio.sleep(wait)
+        
+        return {"error": "MAX_RETRIES_EXCEEDED"}
 
-            except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, OSError) as e:
-                # Сетевые ошибки (DNS, connection refused и т.д.)
-                if attempt == retries - 1:
-                    logger.error(f"Network error on {url}: {e} (after {retries} attempts)")
-                    self._record_failure(str(e))
-
-                    # Если primary провалился — пробуем fallback
-                    if not self._using_fallback and self.fallback_url:
-                        self._primary_fail_streak += 1
-                        if self._primary_fail_streak >= self._fallback_switch_threshold:
-                            self._switch_to_fallback()
-                            # Немедленная попытка через fallback
-                            try:
-                                fb_url = f"{self.fallback_url}{endpoint}"
-                                async with session.request(method, fb_url, params=params) as fb_resp:
-                                    if fb_resp.status == 200:
-                                        fb_data = await fb_resp.json()
-                                        if fb_data.get("retCode") == 0:
-                                            self._record_success()
-                                            return fb_data.get("result", {})
-                            except Exception as fb_e:
-                                logger.error(f"Fallback also failed: {fb_e}")
-                else:
-                    await asyncio.sleep(1 + attempt)
-
-            except Exception as e:
-                logger.error(f"Unexpected error on {url}: {e}. Attempt {attempt + 1}/{retries}")
-                await asyncio.sleep(1 + attempt)
-
-        return {}
+    def rotate_endpoint(self):
+        """[NERVE REPAIR v4.3] Endpoint Fallback Pattern."""
+        self._using_fallback = not self._using_fallback
+        current = self.fallback_url if self._using_fallback else self.primary_url
+        logger.debug(f"🔄 [REST] Endpoint Rotated to: {current}")
 
     async def get_tickers(self) -> List[Dict]:
-        """Fetch all linear tickers."""
-        result = await self._request("GET", "/v5/market/tickers", params={"category": "linear"})
-        return result.get("list", [])
+        res = await self._request("GET", "/v5/market/tickers", {"category": "linear"})
+        return res.get("list", []) if isinstance(res, dict) else []
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
-        """Fetch klines."""
-        params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-        result = await self._request("GET", "/v5/market/kline", params=params)
-        klines = result.get("list", [])
-        klines.reverse()  # Bybit returns descending, we want ascending
+        p = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+        res = await self._request("GET", "/v5/market/kline", params=p)
+        klines = res.get("list", []) if isinstance(res, dict) else []
+        klines.reverse()
         return klines
 
-    async def get_open_interest(self, symbol: str, interval_time: str, limit: int = 5) -> List[Dict]:
-        """Fetch historical Open Interest."""
-        params = {"category": "linear", "symbol": symbol, "intervalTime": interval_time, "limit": limit}
-        result = await self._request("GET", "/v5/market/open-interest", params=params)
-        return result.get("list", [])
+    async def get_orderbook_snapshot(self, symbol: str, limit: int = 50) -> Dict:
+        return await self._request("GET", "/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": limit})
+
+    async def get_recent_trades(self, symbol: str, limit: int = 500) -> List[Dict]:
+        res = await self._request("GET", "/v5/market/recent-trade", {"category": "linear", "symbol": symbol, "limit": limit})
+        return res.get("list", []) if isinstance(res, dict) else []
+
+    async def get_instruments_info(self, category: str = "linear") -> Dict:
+        return await self._request("GET", "/v5/market/instruments-info", {"category": category})
+
+    async def get_server_time(self) -> Dict:
+        return await self._request("GET", "/v5/market/time")
+
+    async def get_wallet_balance(self, headers: Dict) -> Dict:
+        return await self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"}, headers=headers)
+
+    async def get_order_realtime(self, symbol: str, order_link_id: str, headers: Dict) -> Dict:
+        return await self._request("GET", "/v5/order/realtime", {"category": "linear", "symbol": symbol, "orderLinkId": order_link_id}, headers=headers)
+
+    async def get_api_info(self, headers: Dict) -> Dict:
+        return await self._request("GET", "/v5/user/query-api", headers=headers)
+
+    async def get_positions(self, category: str = "linear", symbol: str = None) -> List[Dict]:
+        p = {"category": category}
+        if symbol: p["symbol"] = symbol
+        res = await self._request("GET", "/v5/position/list", p)
+        return res.get("list", []) if isinstance(res, dict) else []

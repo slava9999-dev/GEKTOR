@@ -30,8 +30,14 @@ class GeraldBridgeV2:
         llm_config = {
             "sanitizer": True,
             "providers": {
+                "gemini": {
+                    "enabled": True,
+                    "api_key_env": "GEMINI_API_KEY",
+                    "model": "gemini-2.0-flash",
+                    "rpm": 15,
+                },
                 "deepseek": {
-                    "enabled": False,  # Disabled due to insufficient balance
+                    "enabled": True,
                     "api_key_env": "DEEPSEEK_API_KEY",
                     "base_url": "https://api.deepseek.com/v1",
                     "model": "deepseek-chat",
@@ -45,38 +51,24 @@ class GeraldBridgeV2:
                     "base_url": "https://openrouter.ai/api/v1",
                     "model": "openai/gpt-4o-mini",
                     "rpm": 60,
-                    # Disabled strict checking because tool_args is a dynamic dict[str, Any], which OpenAI Strict Mode hates.
                     "supports_strict_schema": False,
                     "supports_json_object": True,
-                    "extra_body": {
-                        "provider": {
-                            "order": ["OpenAI"],
-                            "ignore": ["Azure"],
-                            "allow_fallbacks": True,
-                        },
-                        "route": "fallback",
-                    },
-                    "extra_headers": {
-                        "HTTP-Referer": "https://gerald-superbrain.local",
-                        "X-Title": "Gerald-SuperBrain"
-                    }
                 },
                 "local": {
                     "enabled": True,
-                    # We reuse existing `LlamaEngine()` parameters from config.yaml under the hood
                 }
             },
             "routing": {
-                "simple": {"primary": "deepseek", "fallback": "gpt4o_mini", "emergency": "local"},
-                "agent":  {"primary": "gpt4o_mini", "fallback": "deepseek", "emergency": "local"},
-                "deep":   {"primary": "gpt4o_mini", "fallback": "deepseek", "emergency": "local"}
+                "simple": {"primary": "gemini", "fallback": "gpt4o_mini", "emergency": "local"},
+                "agent":  {"primary": "gemini", "fallback": "deepseek", "emergency": "local"},
+                "deep":   {"primary": "gemini", "fallback": "deepseek", "emergency": "local"}
             }
         }
         
         self.llm_router = SmartRouter(llm_config)
         self.agent = GeraldAgent(self.llm_router)
         self.indexer = BackgroundIndexer(self.agent.vector_db)
-        self.token = os.getenv("GERALD_BOT_TOKEN")
+        self.token = os.getenv("BRIDGE_BOT_TOKEN") or os.getenv("GERALD_BOT_TOKEN")
         self.chat_id = int(os.getenv("TELEGRAM_CHAT_ID", 0))
         self.offset = self._load_offset()
         self._consecutive_errors = 0
@@ -180,8 +172,7 @@ class GeraldBridgeV2:
                 _sys.path.insert(0, sniper_path)
             from data.database import DatabaseManager
 
-            db_path = os.path.join(BASE_DIR, "skills", "gerald-sniper", "data_run", "sniper.db")
-            db = DatabaseManager(db_path)
+            db = DatabaseManager()
             await db.initialize()
 
             parts = text.strip().split()
@@ -191,75 +182,39 @@ class GeraldBridgeV2:
                 # 1. History Stats
                 stats = await db.get_alert_stats(days=30)
                 
-                # 2. Open Positions
-                import aiosqlite
-                async with aiosqlite.connect(db_path) as conn:
-                    conn.row_factory = aiosqlite.Row
-                    cur = await conn.execute(
-                        "SELECT symbol, direction, entry_price, timestamp FROM alerts WHERE result IS NULL ORDER BY timestamp DESC"
-                    )
-                    open_rows = await cur.fetchall()
+                # 2. Open Positions (Postgres)
+                async with db.SessionLocal() as session:
+                    from sqlalchemy import text as _text
+                    cur = await session.execute(_text(
+                        "SELECT symbol, side, entry_price, opened_at FROM paper_positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
+                    ))
+                    open_rows = cur.mappings().all()
 
                 # 3. Format Response
-                wr = stats.get('win_rate_pct')
-                wr_str = f"{wr}%" if wr is not None else "N/A"
-                
                 reply = "📊 <b>GERALD SNIPER STATS (30d)</b>\n\n"
-                reply += f"📉 Total Alerts: <b>{stats['total_alerts']}</b>\n"
-                reply += f"🎯 Win Rate: <b>{wr_str}</b> ({stats['evaluated_trades']} trades)\n"
+                reply += f"📂 <b>Open Positions: {stats.get('open_positions', 0)}</b>\n"
                 
-                res_str = ""
-                for r, d in stats.get('results_breakdown', {}).items():
-                    res_str += f"  • {r}: {d['count']} (avg {d['avg_pnl']}%)\n"
-                if res_str: reply += res_str
+                breakdown = stats.get('direction_breakdown', [])
+                if breakdown:
+                    reply += "\n🎯 <b>Signal Breakdown:</b>\n"
+                    for b in breakdown:
+                        reply += f" • {b['direction']}: {b['count']} (avg score: {b['avg_score']:.1f})\n"
                 
-                reply += f"\n📂 <b>Open Positions ({len(open_rows)}):</b>\n"
+                reply += f"\n📁 <b>Last 10 Open:</b>\n"
                 if not open_rows:
                     reply += "  <i>No active positions</i>\n"
                 else:
-                    # Show only last 10 for brevity if too many
-                    for row in open_rows[:15]:
-                        dt = row['timestamp'][11:16] # HH:MM
-                        reply += f"  • <code>{row['symbol']}</code> {row['direction']} @ {row['entry_price']} ({dt})\n"
-                    if len(open_rows) > 15:
-                        reply += f"  ... and {len(open_rows)-15} more\n"
+                    for row in open_rows[:10]:
+                        dt = row['opened_at'].strftime("%H:%M") if hasattr(row['opened_at'], 'strftime') else str(row['opened_at'])[11:16]
+                        reply += f"  • <code>{row['symbol']}</code> {row['side']} @ {row['entry_price']} ({dt})\n"
                 
-                reply += f"\n<i>System Status: Operational 🟢</i>"
+                reply += f"\n<i>System Status: Evolution 🧠</i>"
 
             elif cmd == "/report":
                 reply = await db.get_weekly_summary()
 
             elif cmd in ("/win", "/loss", "/skip"):
-                if len(parts) < 2:
-                    reply = f"❌ Формат: {cmd} СИМВОЛ [pnl%]\nПример: {cmd} BTCUSDT 5.2"
-                else:
-                    import aiosqlite
-                    symbol = parts[1].upper()
-                    if not symbol.endswith("USDT"):
-                        symbol += "USDT"
-                    result = cmd.lstrip("/").upper()
-                    pnl = 0.0
-                    if len(parts) > 2:
-                        try:
-                            pnl = float(parts[2].replace(",", "."))
-                        except ValueError:
-                            pass
-                    notes = " ".join(parts[3:]) if len(parts) > 3 else ""
-
-                    async with aiosqlite.connect(db_path) as conn:
-                        conn.row_factory = aiosqlite.Row
-                        cur = await conn.execute(
-                            "SELECT id, timestamp, level_price FROM alerts WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1",
-                            (symbol,)
-                        )
-                        row = await cur.fetchone()
-
-                    if not row:
-                        reply = f"❌ Алерты по {symbol} не найдены."
-                    else:
-                        await db.update_alert_result(row["id"], result, pnl, notes)
-                        emoji = "✅" if result == "WIN" else "❌" if result == "LOSS" else "⏭"
-                        reply = f"{emoji} {symbol} → {result} ({pnl:+.1f}%)\nАлерт от {row['timestamp'][:16]}"
+                reply = "❌ Для /win, /loss используй ручное закрытие в снайпере или дождись системного финализатора."
             else:
                 reply = "❓ Неизвестная команда."
 
@@ -308,10 +263,14 @@ class GeraldBridgeV2:
                         _sys.path.insert(0, sniper_path)
                     from data.database import DatabaseManager
                     
-                    db_path = os.path.join(sniper_path, "data_run", "sniper.db")
-                    db = DatabaseManager(db_path)
+                    db = DatabaseManager()
                     await db.initialize()
-                    await db.update_alert_result(alert_id, result, 0.0, "User interaction via button")
+                    try:
+                        # Attempting to call update_alert_result if it exists on Postgres DB manager
+                        if hasattr(db, 'update_alert_result'):
+                            await db.update_alert_result(alert_id, result, 0.0, "User interaction via button")
+                    except Exception as e:
+                        logger.error(f"Postgres DB update failed: {e}")
 
                     # Remove inline keyboard
                     import json as _json

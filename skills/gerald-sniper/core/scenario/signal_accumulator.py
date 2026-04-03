@@ -14,16 +14,16 @@ CONFLUENCE_RULES = {
     },
     "require_different_groups": False,
     "accumulation_window_sec": 180, # Optimization: 120 -> 180 to capture slower confirmations
-    "min_confidence": 0.65, # Roadmap 10/10: Return to strict but weighted scoring
+    "min_confidence": 0.85, # Restored from 0.45 (NERVE REPAIR v4.0)
 }
 
 FACTOR_WEIGHTS = {
-    "VELOCITY_SHOCK":       0.35,
-    "ACCELERATION":         0.30,
-    "MICRO_MOMENTUM":       0.25,
+    "VELOCITY_SHOCK":       0.30,
+    "ACCELERATION":         0.25,
+    "MICRO_MOMENTUM":       0.20,
     "ORDERBOOK_IMBALANCE":  0.25,
     "LEVEL_PROXIMITY":      0.30,
-    "RADAR_SCORE":          0.15,
+    "RADAR_SCORE":          0.10,
 }
 
 class SignalAccumulator:
@@ -60,14 +60,34 @@ class SignalAccumulator:
             weight = FACTOR_WEIGHTS.get(d.upper(), 0.15)
             confidence += weight
 
+        # EPIC 2: No Man's Land Hard Filter
+        if signal.level_distance_pct is None:
+            return False, 0.0, "REJECTED_NO_STRUCTURE (No level found)"
+
+        # Thresholds based on Tier
+        tier_thresholds = {"A": 1.5, "B": 2.0, "C": 3.0, "D": 4.0}
+        max_dist = tier_thresholds.get(signal.liquidity_tier, 2.0)
+        
+        if signal.level_distance_pct > max_dist:
+            return False, 0.0, f"REJECTED_NO_STRUCTURE ({signal.level_distance_pct:.2f}% > {max_dist}% for Tier {signal.liquidity_tier})"
+
         # 1a. Level Proximity Bonus (v5.2: Gradient scaling)
-        # Replaces binary cutoff at 1.0% with linear decay to 3.0%
-        if signal.level_distance_pct is not None and signal.level_distance_pct < 3.0:
-            max_bonus = FACTOR_WEIGHTS.get("LEVEL_PROXIMITY", 0.30)
-            level_bonus = round(max(0, max_bonus * (1.0 - signal.level_distance_pct / 3.0)), 2)
-            confidence += level_bonus
-            if level_bonus > 0.05:  # Only count as structure if meaningful
-                unique_groups.add("structure")
+        max_bonus = FACTOR_WEIGHTS.get("LEVEL_PROXIMITY", 0.30)
+        level_bonus = round(max(0, max_bonus * (1.0 - signal.level_distance_pct / max_dist)), 2)
+        
+        # EPIC 2: Structural Source Synergy
+        level_sources = getattr(signal, 'level_sources', [])
+        if level_sources:
+            # Count unique source types (e.g. SWING, KDE, ROUND_NUMBER)
+            unique_sources = len(set(s.split(":")[0] for s in level_sources))
+            if unique_sources > 1:
+                synergy_bonus = 0.05 * (unique_sources - 1)
+                level_bonus += synergy_bonus
+                logger.debug(f"🔥 [Accumulator] Added +{synergy_bonus:.2f} synergy bonus for {unique_sources} sources on {signal.symbol}")
+
+        confidence += level_bonus
+        if level_bonus > 0.05:  # Only count as structure if meaningful
+            unique_groups.add("structure")
 
         # 2. Synergy Bonuses (Rule 2.3)
         # Momentum + Structure = +0.10
@@ -78,9 +98,11 @@ class SignalAccumulator:
         if len(detectors) >= 3:
             confidence += 0.05
             
-        # Radar Score Boost (if signal has score metadata)
-        if signal.radar_score > 150:
-            confidence += 0.15
+        # [FIX] Radar Score Boost (Progressive)
+        score = signal.radar_score or 0
+        if score > 70:
+            confidence += 0.10
+            if score > 90: confidence += 0.05
 
         # 3. Validation Logic
         if len(detectors) < CONFLUENCE_RULES["min_factors"]:
@@ -92,7 +114,7 @@ class SignalAccumulator:
         confidence = round(confidence, 2)  # FIX T-01/T-02: IEEE 754 float precision
 
         if confidence < CONFLUENCE_RULES["min_confidence"]:
-            if confidence >= 0.3:
+            if confidence >= 0.25:
                 logger.debug(f"⚠️ [Confluence] {signal.symbol} weak: {confidence:.2f} < {CONFLUENCE_RULES['min_confidence']} | Factors: {detectors}")
             return False, confidence, f"Confidence {confidence:.2f} < {CONFLUENCE_RULES['min_confidence']}"
 

@@ -7,12 +7,21 @@ from typing import Optional, List
 import uuid
 
 class SignalState(Enum):
-    DETECTED = "detected"          # Первичный триггер
-    EVALUATING = "evaluating"      # В процессе проверки фильтрами
-    APPROVED = "approved"          # Прошел все фильтры
-    REJECTED = "rejected"          # Отклонен фильтрами
+    DETECTED = "detected"          # Initial Trigger
+    EVALUATING = "evaluating"      # Processing filters
+    APPROVED = "approved"          # Passed filters
+    REJECTED = "rejected"          # Blocked by Engine
     POSITION_OPEN = "position_open"
     CLOSED = "closed"
+
+class OrderState(Enum):
+    IDLE = "idle"
+    PENDING_OPEN = "pending_open"
+    OPEN = "open"
+    FILLED = "filled"
+    PENDING_CANCEL = "pending_cancel"
+    CANCELED = "canceled"
+    REJECTED = "rejected"
 
 @dataclass
 class TradingSignal:
@@ -20,8 +29,41 @@ class TradingSignal:
     symbol: str = ""
     detectors: List[str] = field(default_factory=list)
     state: SignalState = SignalState.DETECTED
+    order_state: OrderState = OrderState.IDLE
     detected_at: datetime = field(default_factory=datetime.utcnow)
     state_history: List[dict] = field(default_factory=list) # [{state, ts, reason}]
+    
+    # Microstructure Safeguards
+    initial_iceberg_vol: float = 0.0 # Snapshot for decay detection
+    filled_qty: float = 0.0 # Atomic Fill Tracking (v2.1.4)
+    order_id: Optional[str] = None # Exchange Order ID
+    
+    def __post_init__(self):
+        self._lock = asyncio.Lock()
+        
+    async def transition_order_state(self, expected: List[OrderState], new: OrderState, reason: str = "") -> bool:
+        """
+        Atomic Transition (CAP/Consistency).
+        Prevents WebSocket/REST race conditions (The Phantom Fill).
+        """
+        async with self._lock:
+            if self.order_state not in expected:
+                import loguru
+                loguru.logger.warning(
+                    f"⚠️ [Order {self.id}] Illegal transition: "
+                    f"{self.order_state.name} -> {new.name} | Current expected: {[s.name for s in expected]}"
+                )
+                return False
+            
+            from loguru import logger
+            logger.info(f"🔄 [Order {self.id}] State: {self.order_state.name} -> {new.name} ({reason})")
+            self.order_state = new
+            self.state_history.append({
+                "order_state": new.name,
+                "ts": datetime.utcnow().isoformat(),
+                "reason": reason
+            })
+            return True
     
     # Факторы для принятия решения
     btc_trend_1h: str = "FLAT"
@@ -34,16 +76,30 @@ class TradingSignal:
     priority_age_sec: float = 0.0
     liquidity_tier: str = "C"
     confidence_score: float = 0.0 # FIX T-FATAL: Added missing attribute
+    market_regime: Optional[str] = None # Task 4.2: Dynamic Microstructure Label
+    ob_imbalance: float = 1.0 # Bids / Asks ratio
+    cvd_delta: float = 0.0 # Taker Buy - Taker Sell Volume
+    is_absorption: bool = False # Price holding vs High CVD pressure
     
     # Исполнение
     entry_price: Optional[float] = None
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
+    position_size: Optional[float] = None # Added for Risk Engine
     direction: str = "" # LONG/SHORT
+    execution_type: str = "MARKET" # LIMIT or MARKET
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    
+    # [NERVE REPAIR v4.2] Dynamic Trailing
+    highest_mark: float = 0.0 # High water mark for LONG / Low for SHORT
+    last_atr: float = 0.0
     
     rejection_reason: Optional[str] = None
 
     def __post_init__(self):
+        import asyncio
+        self._lock = asyncio.Lock()
         if not self.state_history:
             self.state_history.append({
                 "state": self.state.value,

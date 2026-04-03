@@ -1,264 +1,170 @@
 import numpy as np
 import math
 from scipy.signal import argrelextrema, find_peaks
-from scipy.stats import gaussian_kde
 from loguru import logger
-from typing import List, Dict
+from typing import List, Dict, Any
 from utils.safe_math import safe_float
 
 
-def _get_adaptive_params(atr_pct: float, current_price: float, config: dict) -> dict:
+def detect_swing_points(candles_h1: List[Dict], left: int = 5, right: int = 5) -> List[Dict]:
     """
-    Адаптирует параметры уровней под волатильность монеты.
-    Чем выше ATR — тем шире допуск.
+    Точка является swing high/low если она выше/ниже всех N свечей слева и справа.
+    """
+    levels = []
+    highs = [safe_float(c.get('high', 0)) for c in candles_h1]
+    lows = [safe_float(c.get('low', 0)) for c in candles_h1]
     
-    Логика:
-    - min_touches = 2 (двойная вершина/дно — это уже уровень)
-    - touch_tolerance = 25% от среднего размера свечи (ATR), 
-      с ограничением от 0.4% до 2.0%.
-    - max_distance = расширяется на высоковолатильных монетах.
+    for i in range(left, len(candles_h1) - right):
+        is_high = all(highs[i] >= highs[j] for j in range(i-left, i+right+1) if j != i)
+        is_low = all(lows[i] <= lows[j] for j in range(i-left, i+right+1) if j != i)
+        
+        if is_high:
+            levels.append({'price': highs[i], 'type': 'RESISTANCE', 'idx': i})
+        if is_low:
+            levels.append({'price': lows[i], 'type': 'SUPPORT', 'idx': i})
+            
+    return levels
+
+def cluster_levels(swing_points: List[Dict], current_price: float, tolerance_pct: float = 0.5) -> List[Dict]:
     """
-    base_touches = config.get('min_touches', 2)
-    base_distance = config.get('max_distance_pct', 5.0)
+    Группирует swing points в кластеры уровней (Алгоритм Level Clustering).
+    """
+    if not swing_points: return []
+    
+    # Sort by price
+    sorted_points = sorted(swing_points, key=lambda x: x['price'])
+    clusters = []
+    
+    if not sorted_points: return []
+    
+    current_cluster = [sorted_points[0]]
+    
+    for pt in sorted_points[1:]:
+        dist_pct = abs(pt['price'] - current_cluster[-1]['price']) / current_cluster[-1]['price'] * 100
+        
+        if dist_pct <= tolerance_pct:
+            current_cluster.append(pt)
+        else:
+            avg_price = sum(p['price'] for p in current_cluster) / len(current_cluster)
+            res_touches = len([p for p in current_cluster if p['type'] == 'RESISTANCE'])
+            sup_touches = len([p for p in current_cluster if p['type'] == 'SUPPORT'])
+            last_touch_idx = max(p['idx'] for p in current_cluster)
+            
+            clusters.append({
+                'price': avg_price,
+                'touches': len(current_cluster),
+                'res_count': res_touches,
+                'sup_count': sup_touches,
+                'last_idx': last_touch_idx,
+                'points': current_cluster
+            })
+            current_cluster = [pt]
+            
+    # Add last
+    avg_price = sum(p['price'] for p in current_cluster) / len(current_cluster)
+    clusters.append({
+        'price': avg_price,
+        'touches': len(current_cluster),
+        'res_count': len([p for p in current_cluster if p['type'] == 'RESISTANCE']),
+        'sup_count': len([p for p in current_cluster if p['type'] == 'SUPPORT']),
+        'last_idx': max(p['idx'] for p in current_cluster),
+        'points': current_cluster
+    })
+    
+    return clusters
 
-    # Adaptive min_touches: volatile coins (ATR>2%) rarely form 3+ touches
-    # but 2 touches on a wide-range coin ARE significant (double top/bottom)
-    if atr_pct > 2.0:
-        base_touches = max(2, base_touches - 1)
+def calculate_level_strength(c: Dict, current_price: float, total_candles: int, natr: float) -> float:
+    """
+    Strength = (touches * 15) + TF bonuses + Recency + Round bonus (Алгоритм Level Strength).
+    """
+    strength = c['touches'] * 15.0
+    
+    # Recency: if touched in last 24 candles (for H1) -> +10
+    hours_ago = total_candles - 1 - c['last_idx']
+    if hours_ago < 24:
+        strength += 10.0
+        
+    # Roundness bonus
+    price = c['price']
+    if abs(price - round(price, 0)) < (price * 0.001) or \
+       abs(price * 10 - round(price * 10, 0)) < (price * 0.001):
+        strength += 5.0
+        
+    # Cap at 100
+    return min(100.0, strength)
 
-    # Допуск касания составляет 25% от средней дневной свечи (ATR H1)
-    # Мин. 0.4%, макс. 2.0%
-    dynamic_tolerance = max(0.004, min(0.020, (atr_pct / 100.0) * 0.25))
-
-    distance_multiplier = 1.5 if atr_pct > 5.0 else 1.0
-
-    return {
-        'min_touches': base_touches,
-        'touch_tolerance_pct': dynamic_tolerance,
-        'max_distance_pct': base_distance * distance_multiplier,
-    }
+def find_confluence(level_price: float, htf_levels: List[float], tolerance_pct: float = 0.8) -> bool:
+    """
+    Ищет подтверждение уровня на старшем ТФ (HTF Confluence).
+    """
+    for htf in htf_levels:
+        dist = abs(level_price - htf) / htf * 100
+        if dist <= tolerance_pct:
+            return True
+    return False
 
 
 def detect_levels(
-    candles_h1: List[Dict],      # Minimum 20 candles H1
+    candles_h1: List[Dict],
     current_price: float,
     config: Dict
 ) -> List[Dict]:
-    """
-    KDE-уровни: кластеризация свинг-экстремумов.
-    Использует адаптивные параметры в зависимости от ATR монеты.
-    """
-    if len(candles_h1) < 20:
+    if len(candles_h1) < 20: 
         return []
 
-    highs = np.array([safe_float(c['high']) for c in candles_h1])
-    lows = np.array([safe_float(c['low']) for c in candles_h1])
-
-    # Расчёт ATR% для адаптивной логики
+    highs = np.array([safe_float(c.get('high', 0)) for c in candles_h1])
+    lows = np.array([safe_float(c.get('low', 0)) for c in candles_h1])
     atr = np.mean([abs(h - l) for h, l in zip(highs, lows)])
-    atr_pct = (atr / current_price) * 100 if current_price > 0 else 1.0
+    natr = (atr / current_price) * 100 if current_price > 0 else 1.0
 
-    # Адаптивные параметры на основе волатильности
-    adaptive = _get_adaptive_params(atr_pct, current_price, config)
-    min_touches = adaptive['min_touches']
-    dynamic_tolerance = adaptive['touch_tolerance_pct']
-    max_distance_pct = adaptive['max_distance_pct']
-
-    # STEP 1: Свинг-экстремумы
-    swing_order = config.get('swing_order', 5)
-
-    if len(highs) <= swing_order * 2:
-        return []
-
-    swing_high_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
-    swing_low_idx = argrelextrema(lows, np.less, order=swing_order)[0]
-
-    swing_highs = highs[swing_high_idx]
-    swing_lows = lows[swing_low_idx]
-
-    all_extremes = np.concatenate([swing_highs, swing_lows])
-
-    logger.info(
-        f"📐 Adaptive: price={current_price:.4f}, ATR={atr_pct:.1f}%: "
-        f"touches={min_touches}, tolerance={dynamic_tolerance*100:.1f}%, "
-        f"max_dist={max_distance_pct:.1f}%, extremes={len(all_extremes)}"
-    )
+    # 1. Swing Point Detection (Fractal Algorithm)
+    swings = detect_swing_points(candles_h1, left=config.get('swing_left', 5), right=config.get('swing_right', 5))
     
-    if len(all_extremes) < 3:
-        logger.debug(f"KDE skipped: only {len(all_extremes)} extremes found (need 3+)")
-        return []
-
-    # Chop-zone detection: instead of hard-rejecting high-touch levels,
-    # we apply a progressive strength penalty. A level that attracts 60%+ of
-    # all extremes is likely noise, but could also be a genuinely important
-    # consolidation zone. Penalty scales from 0% to 50% of strength.
-    total_extremes_count = len(all_extremes)
-
-    # STEP 2: KDE кластеризация
-    price_range_width = all_extremes.max() - all_extremes.min()
-    if price_range_width == 0:
-        return []
-
-    # Адаптивная KDE bandwidth
-    if config.get('kde_bandwidth_adaptive', True):
-        target_pct = (atr_pct / 100) * 1.5
-        target_pct = max(
-            config.get('kde_bandwidth_min', 0.008),
-            min(config.get('kde_bandwidth_max', 0.025), target_pct)
-        )
-    else:
-        target_pct = config.get('kde_bandwidth', 0.015)
-
-    data_std = np.std(all_extremes)
-    if data_std == 0:
-        bw = 0.1
-    else:
-        data_mean = np.mean(all_extremes)
-        desired_bandwidth = data_mean * target_pct
-        n_ext = len(all_extremes)
-        scott_factor = n_ext ** (-1.0 / 5.0)
-        bw_computed = desired_bandwidth / (scott_factor * data_std)
-        bw = max(0.01, safe_float(bw_computed))
-
-    try:
-        kde = gaussian_kde(all_extremes, bw_method=bw)
-    except np.linalg.LinAlgError as e:
-        logger.warning(f"KDE failed (singular matrix): {e}")
-        return []
-
-    grid = np.linspace(
-        all_extremes.min() - price_range_width * 0.05,
-        all_extremes.max() + price_range_width * 0.05,
-        2000
-    )
-    density = kde(grid)
-
-    # STEP 3: Пики плотности = ценовые уровни
-    peaks_idx, properties = find_peaks(density, height=np.max(density) * 0.15)
-    candidate_levels = grid[peaks_idx]
-
-
-    freshness_enabled = config.get('freshness_enabled', True)
-    freshness_decay_hours = config.get('freshness_decay_hours', 72)
-    freshness_penalty_pct = config.get('freshness_penalty_pct', 20)
-
-    total_candles = len(candles_h1)
-
+    # 2. Level Clustering
+    # Adaptive Clustering Tolerance based on NATR
+    cluster_tol = max(0.2, min(0.8, natr * 0.3))
+    clusters = cluster_levels(swings, current_price, tolerance_pct=cluster_tol)
+    
     levels = []
-    for level_price in candidate_levels:
-        # Инициализация в начале каждой итерации (Задача #11)
-        hours_ago = 0
-        is_stale = False
-        touch_indices = []
-
-        # Zone tolerance for touch counting.
-        # CRITICAL: `bw` is scipy's dimensionless bandwidth FACTOR, not price units.
-        # The actual bandwidth in price space = bw * scott_factor * data_std
-        # We use dynamic_tolerance (from ATR) as the primary zone width,
-        # with a small KDE-derived expansion to account for cluster width.
-        actual_bw_price = bw * scott_factor * data_std if data_std > 0 else 0
-        kde_zone_pct = (actual_bw_price / current_price * 0.45) if current_price > 0 else 0
-        zone_tolerance = max(dynamic_tolerance, min(kde_zone_pct, dynamic_tolerance * 5))
-
-        zone_low = level_price * (1 - zone_tolerance)
-        zone_high = level_price * (1 + zone_tolerance)
-
-        # Какие экстремумы коснулись этого уровня
-        res_mask = (swing_highs >= zone_low) & (swing_highs <= zone_high)
-        sup_mask = (swing_lows >= zone_low) & (swing_lows <= zone_high)
-
-        res_touches = int(np.sum(res_mask))
-        sup_touches = int(np.sum(sup_mask))
-        total_touches = res_touches + sup_touches
-
-        # For KDE levels, the peak itself inherently proves price clustering.
-        # We can be slightly more lenient on exact rigid touches.
-        min_touches_kde = max(1, min_touches - 1)
-
-        if total_touches < min_touches_kde:
-            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches} touches < {min_touches_kde} required (KDE softened)")
+    total_candles = len(candles_h1)
+    
+    for c in clusters:
+        # Distance check
+        dist_pct = abs(c['price'] - current_price) / current_price * 100
+        if dist_pct > config.get('max_distance_pct', 5.0):
             continue
-
-        # Chop-zone progressive penalty instead of hard rejection
-        touch_ratio = total_touches / total_extremes_count if total_extremes_count > 0 else 0
-        chop_penalty = 0.0
-        if touch_ratio > 0.95:  # >95% of ALL extremes on one level = truly flat coin
-            logger.info(f"KDE level {level_price:.6f} rejected: {total_touches}/{total_extremes_count} touches ({touch_ratio:.0%}) = flat/dead zone")
-            continue
-        elif touch_ratio > 0.6:  # >60% = likely chop zone, heavy penalty
-            chop_penalty = min(0.5, (touch_ratio - 0.6) / 0.35 * 0.5)  # 0% → 50% penalty
-            logger.debug(f"KDE level {level_price:.6f}: chop penalty {chop_penalty:.0%} (touch_ratio={touch_ratio:.0%})")
-
-        level_type = 'RESISTANCE' if level_price > current_price else 'SUPPORT'
-        distance_pct = abs(level_price - current_price) / current_price * 100
-
-        # Высококачественные уровни видны издалека
-        effective_max_dist = max_distance_pct
-        if total_touches >= 10:
-            effective_max_dist *= 2.5
-        elif total_touches >= 5:
-            effective_max_dist *= 1.5
             
-        if distance_pct > effective_max_dist:
-            continue
-
-        # Базовая сила (log шкала — дифференцирует 6 vs 15 vs 24 касания)
-        touches_mult = min(math.log2(total_touches + 1) / math.log2(30), 1.0)
-        strength = touches_mult * 70.0 + max(0, 30 - distance_pct * 10)
+        strength = calculate_level_strength(c, current_price, total_candles, natr)
         
-        # Apply chop penalty
-        if chop_penalty > 0:
-            strength *= (1.0 - chop_penalty)
-
-        # Проверка свежести
-        if freshness_enabled:
-            touch_indices = []
-            if res_touches > 0:
-                touch_indices.extend(swing_high_idx[res_mask].tolist())
-            if sup_touches > 0:
-                touch_indices.extend(swing_low_idx[sup_mask].tolist())
-
-            if touch_indices:
-                last_touch_idx = max(touch_indices)
-                hours_ago = total_candles - 1 - last_touch_idx
-                is_stale = hours_ago > freshness_decay_hours
-                if is_stale:
-                    strength -= (strength * (freshness_penalty_pct / 100.0))
-
-        strength = min(100.0, max(0.0, strength))
-
+        # Digash Filter: Only keep levels with at least 2 touches or high strength
+        if c['touches'] < 2 and strength < 40:
+            continue
+            
+        ltype = 'RESISTANCE' if c['price'] > current_price else 'SUPPORT'
+        
         levels.append({
-            'price': round(safe_float(level_price), 8),
-            'type': level_type,
-            'touches': total_touches,
-            'resistance_touches': res_touches,
-            'support_touches': sup_touches,
-            'distance_pct': round(safe_float(distance_pct), 2),
+            'price': round(safe_float(c['price']), 8),
+            'type': ltype,
+            'touches': c['touches'],
+            'resistance_touches': c['res_count'],
+            'support_touches': c['sup_count'],
+            'distance_pct': round(safe_float(dist_pct), 2),
             'strength': round(safe_float(strength), 1),
-            'stale': is_stale,
-            'source': 'KDE',
-            'hours_since_touch': hours_ago,
+            'stale': (total_candles - 1 - c['last_idx']) > config.get('freshness_decay_hours', 72),
+            'source': 'SWING_CLUSTER',
+            'hours_since_touch': total_candles - 1 - c['last_idx'],
         })
-
+        
     levels.sort(key=lambda x: (-x['strength'], x['distance_pct']))
-
-    max_levels = config.get('max_levels_per_coin', 6)
-    return levels[:max_levels]
+    return levels[:config.get('max_levels_per_coin', 6)]
 
 
 def detect_dynamic_levels(
     candles_h1: List[Dict],
     current_price: float,
-    config: Dict
+    config: Dict,
+    symbol: str = "UNKNOWN"
 ) -> List[Dict]:
-    """
-    Динамические уровни, не зависящие от кластеризации касаний:
-    - Недельный максимум/минимум
-    - Круглые числа (психологические уровни)
-    
-    Критичны для импульсных монет, где KDE-уровни не формируются
-    из-за хаотичных свингов.
-    """
     if not candles_h1 or current_price <= 0:
         return []
 
@@ -293,9 +199,9 @@ def detect_dynamic_levels(
             levels.append({
                 'price': round(safe_float(price), 8),
                 'type': ltype,
-                'touches': 2, # Promoted base score assuming 2, score logic handles it
-                'resistance_touches': 2 if ltype == 'RESISTANCE' else 0,
-                'support_touches': 2 if ltype == 'SUPPORT' else 0,
+                'touches': 2, # Base significance for a weekly extreme
+                'resistance_touches': 1 if ltype == 'RESISTANCE' else 0,
+                'support_touches': 1 if ltype == 'SUPPORT' else 0,
                 'distance_pct': round(dist_pct, 2),
                 'strength': 60.0, # Increased from 50 to differentiate from trash
                 'stale': False,
@@ -329,31 +235,50 @@ def detect_dynamic_levels(
             dist_pct = abs(rn - current_price) / current_price * 100
             
             # Проверяем: был ли разворот у этого круглого числа?
-            touch_count = 0
+            raw_touches = 0
             tolerance = rn * 0.003  # 0.3% зона
             for h, l in zip(highs, lows):
                 if abs(h - rn) < tolerance or abs(l - rn) < tolerance:
-                    touch_count += 1
+                    raw_touches += 1
                     
             effective_max_dist = max_distance_pct
-            if touch_count >= 10:
+            if raw_touches >= 10:
                 effective_max_dist *= 2.5
-            elif touch_count >= 5:
+            elif raw_touches >= 5:
                 effective_max_dist *= 1.5
 
             if 0.1 < dist_pct < effective_max_dist:
 
                 # Continuous scoring: base + touches + proximity bonus
                 proximity_bonus = max(0, 10 - dist_pct * 3)  # closer = better
-                strength = 30.0 + (touch_count * 6) + proximity_bonus
+                
+                # --- NOISE REDUCTION: Ignore Round Numbers with 0 historical touches ---
+                if raw_touches < 1:
+                    continue
+
+                # --- ANTI-ROUND-NUMBER BIAS ---
+                # Force raw touches to 1 to prevent artificial scoring inflation
+                effective_touches = 1
+                # Adjusted formula: base 45 + bonus. Max around 60. 
+                # This allows them to pass the 55-score alert threshold when very close.
+                strength = (45.0 + (effective_touches * 5) + proximity_bonus) 
+                # Extra bonus if it has 3+ real touches
+                if raw_touches >= 3:
+                     strength += 5
+
                 strength = min(safe_float(dynamic_max_strength), strength)
+
+                logger.debug(
+                    f"[ROUND_DEBUG] symbol={symbol} source=ROUND_NUMBER raw_touches={raw_touches} "
+                    f"effective_touches={effective_touches} score={strength:.1f}"
+                )
 
                 levels.append({
                     'price': round(safe_float(rn), 8),
                     'type': ltype,
-                    'touches': touch_count,
-                    'resistance_touches': touch_count if ltype == 'RESISTANCE' else 0,
-                    'support_touches': touch_count if ltype == 'SUPPORT' else 0,
+                    'touches': raw_touches, # Keep real touches for audit
+                    'resistance_touches': raw_touches if ltype == 'RESISTANCE' else 0,
+                    'support_touches': raw_touches if ltype == 'SUPPORT' else 0,
                     'distance_pct': round(dist_pct, 2),
                     'strength': round(strength, 1),
                     'stale': False,
@@ -375,37 +300,68 @@ def detect_dynamic_levels(
 
 
 def validate_kline_data(candles: List[Dict], symbol: str) -> List[Dict]:
-    """Фильтрует аномальные свечи перед расчётом уровней."""
-    if len(candles) < 20:
+    """Фильтрует аномальные свечи (шпильки, битые данные) перед расчётом уровней."""
+    if len(candles) < 30:
         return candles
 
-    closes = [safe_float(c['close']) for c in candles[-50:]]
-    # safe guard if closes is empty somehow
-    median = sorted(closes)[len(closes) // 2] if closes else 1.0
+    # Extract prices for statistical analysis
+    highs = np.array([safe_float(c.get('high', 0)) for c in candles])
+    lows = np.array([safe_float(c.get('low', 0)) for c in candles])
+    closes = np.array([safe_float(c.get('close', 0)) for c in candles])
+    
+    # Avoid division by zero
+    valid_mask = closes > 0
+    if not np.any(valid_mask):
+        return candles
 
+    ranges = np.zeros_like(closes)
+    ranges[valid_mask] = (highs[valid_mask] - lows[valid_mask]) / closes[valid_mask]
+    
+    # Use Median and MAD (Median Absolute Deviation) for robust outlier detection
+    med_range = np.median(ranges)
+    mad_range = np.median(np.abs(ranges - med_range))
+    if mad_range == 0:
+        mad_range = med_range * 0.1 # Fallback
+    
+    # Threshold for "crazy" volatility (Z-score > 8 roughly, or absolute > 25%)
+    # Liquid alts on 1h rarely move > 15-20% in a single candle without it being a flash-crash/spike
+    upper_bound = max(0.20, med_range + 10 * mad_range)
+    
     clean = []
-    removed = 0
-    for c in candles:
-        close_p = safe_float(c['close'])
-        high_p = safe_float(c['high'])
-        low_p = safe_float(c['low'])
+    removed_count = 0
+    
+    # Reference median price for sanity check
+    recent_median_price = np.median(closes[-50:]) if len(closes) >= 50 else np.median(closes)
 
-        # Цена > 5x или < 0.2x от медианы последних 50 свечей
-        if close_p > median * 5 or close_p < median * 0.2:
-            removed += 1
+    for i, c in enumerate(candles):
+        r = ranges[i]
+        price = closes[i]
+        
+        # 1. Price Sanity (0.2x to 5x of median)
+        if price > recent_median_price * 5 or price < recent_median_price * 0.2:
+            removed_count += 1
             continue
-
-        # Свеча с range > 50% от цены — аномалия
-        if high_p > 0 and (high_p - low_p) / high_p > 0.5:
-            removed += 1
-            continue
+            
+        # 2. Range Anomaly (flash spikes)
+        if r > upper_bound:
+            # Check if it's a "confirmed" level or just a wick. 
+            # If body is small but range is huge -> it's a spike.
+            body = abs(safe_float(c.get('open', 0)) - price) / price
+            if body < r * 0.3: # Spike with small body
+                removed_count += 1
+                continue
+                
+        # 3. Flat / Zero-data candles (sometimes Bybit sends these during maintenance)
+        if r == 0 and i > 0 and price == closes[i-1]:
+            # This is fine, just duplicate/stale, but not an anomaly to "gate"
+            pass
 
         clean.append(c)
 
-    if removed > 0:
+    if removed_count > 0:
         logger.warning(
-            f"🗑️ {symbol}: Removed {removed} anomalous "
-            f"candles (median={median:.6f})"
+            f"🗑️ {symbol}: Gated {removed_count} anomalous candles "
+            f"(Upper range bound: {upper_bound:.2%}, Median range: {med_range:.2%})"
         )
 
     return clean
@@ -417,17 +373,13 @@ def detect_all_levels(
     config: Dict,
     symbol: str = "UNKNOWN"
 ) -> List[Dict]:
-    """
-    Главная функция: объединяет KDE (структурные) и динамические уровни.
-    Вызывается из main.py вместо detect_levels.
-    """
     candles_h1 = validate_kline_data(candles_h1, symbol)
     
     # KDE-уровни (существующая логика с адаптивными порогами)
     kde_levels = detect_levels(candles_h1, current_price, config)
 
     # Динамические уровни (новое)
-    dyn_levels = detect_dynamic_levels(candles_h1, current_price, config)
+    dyn_levels = detect_dynamic_levels(candles_h1, current_price, config, symbol=symbol)
 
     logger.info(
         f"📐 KDE: {len(kde_levels)} levels, Dynamic: {len(dyn_levels)} levels "
@@ -450,7 +402,7 @@ def detect_all_levels(
             final.append(dyn)
 
     # Сортировка: сильнейшие и ближайшие первые
-    final.sort(key=lambda x: (-x['strength'], x['distance_pct']))
+    final.sort(key=lambda x: (-x.get('strength', 0), x.get('distance_pct', 999)))
 
     max_levels = config.get('max_levels_per_coin', 6)
 

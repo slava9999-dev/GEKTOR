@@ -17,6 +17,7 @@ Usage:
 """
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from loguru import logger
 
@@ -48,7 +49,7 @@ class MarketSentiment:
         self._score: int = 0
         self._label: str = "NEUTRAL"
         self._last_update: float = 0.0
-        self._history: list[SentimentSnapshot] = []
+        self._history: deque = deque(maxlen=100)
         self._btc_change_1h: float = 0.0
         self._btc_change_4h: float = 0.0
         self._momentum_aligned: bool = False
@@ -120,8 +121,6 @@ class MarketSentiment:
             momentum_aligned=self._momentum_aligned,
         )
         self._history.append(snapshot)
-        if len(self._history) > 50:
-            self._history.pop(0)
         
         logger.info(
             f"🌡️ [Sentiment] Score: {self._score:+d} ({self._label}) | "

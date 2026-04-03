@@ -44,3 +44,38 @@ class HistorySummarizer:
         except Exception as e:
             logger.error(f"Summarization failed: {e}")
             return "Ошибка при сжатии истории."
+
+    async def summarize_data(self, tool_name: str, raw_data: str) -> str:
+        """
+        Specialized quantitative summarization for tool outputs (SQL/Files).
+        Prevents context window overflow in local models (7B range).
+        """
+        if not raw_data or len(raw_data) < 1500:
+            return raw_data
+
+        prompt = (
+            "### TASK: QUANTITATIVE SUMMARY\n"
+            f"You are the memory compression module for GERALD. Tool '{tool_name}' returned a large raw output. "
+            "Compress this into a highly dense, analytical summary. Preserve all critical numbers, symbols, and anomalies. "
+            "If it's an SQL result, list only the TOP 3 candidates and a summary of the rest.\n\n"
+            f"### RAW_TOOL_DATA:\n{raw_data[:8000]}\n\n"
+            "### ANALYTICAL_SUMMARY (Dense, Russian Language):"
+        )
+
+        try:
+            logger.info(f"⚡ Compressing large tool output from '{tool_name}'...")
+            from pydantic import BaseModel
+            class DataSummary(BaseModel):
+                summary: str
+
+            result = await self.llm.generate_structured(
+                prompt=prompt,
+                response_model=DataSummary,
+                max_tokens=256,
+                task_type="simple"
+            )
+            summary = f"📑 [DENSE_SUMMARY of {tool_name}]: {result.summary}"
+            return summary
+        except Exception as e:
+            logger.error(f"Data summarization failed: {e}")
+            return raw_data[:1500] + "\n... [AUTO_TRUNCATED due to volume]"

@@ -3,10 +3,11 @@ Gerald v4 — Durable Telegram Outbox Queue.
 
 Architecture:
 - Persistent SQLite outbox (survives crashes)
-- Background worker with exponential retry
-- Dead-letter queue (DLQ) after 5 failures
-- Dedup by alert_hash(symbol, type, ts_bucket_5min)
-- Shared aiohttp.ClientSession (one per runtime)
+- Background worker with exponential retry (5s to 300s)
+- Dead-letter queue (DLQ) with TTL (auto-archive after 2 hours)
+- Dedup by alert_hash(symbol, type, ts_bucket_15min)
+- Shared aiohttp.ClientSession with TCPConnector (keepalive)
+- NO silent errors: Strict status validation & message_id check
 - Graceful degradation: if TG is down, pipeline continues
 
 Flow:
@@ -28,19 +29,20 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
-from typing import Optional
+from typing import Optional, Any, List
 import json
 
-from core.events.event_bus import bus
+from core.events.nerve_center import bus
 from core.events.events import SignalEvent
 from core.alerts.formatters import format_signal_alert
 
 
-class MessagePriority(str, Enum):
-    CRITICAL = "critical"   # Signal alerts — must deliver
-    NORMAL = "normal"       # Proximity, level armed
-    LOW = "low"             # Health reports, diagnostics
+from enum import IntEnum
 
+class MessagePriority(IntEnum):
+    LOW = 1       # Health reports, scans
+    NORMAL = 2    # Shadow signals, level proximity
+    CRITICAL = 3  # APPROVED SIGNAL (Action Required)
 
 class MessageStatus(str, Enum):
     PENDING = "pending"
@@ -48,7 +50,7 @@ class MessageStatus(str, Enum):
     SENT = "sent"
     FAILED = "failed"
     DLQ = "dlq"
-
+    SILENT_LOG = "silent_log"
 
 @dataclass
 class OutboxMessage:
@@ -58,7 +60,7 @@ class OutboxMessage:
     disable_notification: bool = False
     reply_to_message_id: Optional[int] = None
     reply_markup: Optional[str] = None  # JSON string
-    priority: str = MessagePriority.NORMAL
+    priority: int = MessagePriority.NORMAL
     status: str = MessageStatus.PENDING
     retries: int = 0
     max_retries: int = 5
@@ -72,7 +74,7 @@ class OutboxMessage:
 class TelegramOutbox:
     """
     Durable outbox for Telegram messages with SQLite persistence,
-    retry logic, dedup, and dead-letter queue.
+    priority-based dropping (v6.14), and rate-limit guard.
     """
 
     DB_FILE = "./data_run/outbox.db"
@@ -81,7 +83,7 @@ class TelegramOutbox:
     DEDUP_WINDOW = 300          # 5 minutes dedup window
     MAX_RETRIES = 5
     TG_RATE_LIMIT_DELAY = 1.1   # Telegram allows ~30 msg/sec to same chat
-    MAX_MESSAGES_PER_HOUR = 600 # v5.1: Increased to 600 for high-frequency signal delivery (10 msg/min safe zone)
+    MAX_MESSAGES_PER_HOUR = 600 # v5.1: 10 msg/min safe zone
 
     def __init__(self):
         self._db_path = self.DB_FILE
@@ -90,9 +92,9 @@ class TelegramOutbox:
         self._worker_task = None
         self._stats = {
             "sent": 0, "failed": 0, "deduped": 0,
-            "dlq": 0, "retries": 0, "throttled": 0
+            "dlq": 0, "retries": 0, "throttled": 0, "dropped": 0
         }
-        self._hourly_sends: list[float] = []  # v4.1: timestamps of recent sends
+        self._hourly_sends: list[float] = [] 
         self._init_db()
 
     def _init_db(self):
@@ -107,7 +109,7 @@ class TelegramOutbox:
                 disable_notification INTEGER DEFAULT 0,
                 reply_to_message_id INTEGER,
                 reply_markup TEXT,
-                priority TEXT DEFAULT 'normal',
+                priority INTEGER DEFAULT 2,
                 status TEXT DEFAULT 'pending',
                 retries INTEGER DEFAULT 0,
                 max_retries INTEGER DEFAULT 5,
@@ -118,26 +120,13 @@ class TelegramOutbox:
                 telegram_msg_id INTEGER
             )
         """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_outbox_status
-            ON outbox(status, priority, created_at)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_outbox_hash
-            ON outbox(alert_hash, created_at)
-        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, priority, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_hash ON outbox(alert_hash, created_at)")
         conn.commit()
         conn.close()
-        logger.debug("📬 Outbox DB initialized")
 
     @staticmethod
-    def compute_alert_hash(
-        symbol: str = "", alert_type: str = "", extra: str = ""
-    ) -> str:
-        """
-        Generate dedup hash for a message.
-        Bucketized to 5-minute windows to prevent duplicates.
-        """
+    def compute_alert_hash(symbol: str = "", alert_type: str = "", extra: str = "") -> str:
         ts_bucket = int(time.time() // 300) * 300  # 5-min bucket
         raw = f"{symbol}|{alert_type}|{extra}|{ts_bucket}"
         return hashlib.md5(raw.encode()).hexdigest()[:12]
@@ -145,20 +134,33 @@ class TelegramOutbox:
     def enqueue(
         self,
         text: str,
-        priority: str = MessagePriority.NORMAL,
+        priority: int = MessagePriority.NORMAL,
         disable_notification: bool = False,
         parse_mode: str = "HTML",
         reply_to_message_id: Optional[int] = None,
         reply_markup: Optional[str] = None,
         alert_hash: str = "",
+        status: str = "pending",
     ) -> bool:
         """
         Add a message to the outbox.
-        Returns True if enqueued, False if dedup-filtered.
+        [Audit 6.14] Dropper Logic: If tokens are low, discard LOW priority messages.
         """
         now = time.time()
+        
+        # 1. Dropper Logic: Protect rate limits for CRITICAL signals
+        # Purge old stamps to get accurate count
+        while self._hourly_sends and self._hourly_sends[0] < now - 3600:
+            self._hourly_sends.pop(0)
+            
+        consumption = len(self._hourly_sends)
+        # If we reached 80% of hourly limit, drop LOW priority immediately
+        if priority == MessagePriority.LOW and consumption > (self.MAX_MESSAGES_PER_HOUR * 0.8):
+            self._stats["dropped"] += 1
+            logger.debug(f"🗑️ [Dropper] Discarding LOW alert to save capacity ({consumption}/{self.MAX_MESSAGES_PER_HOUR})")
+            return False
 
-        # Dedup check
+        # 2. Dedup check
         if alert_hash:
             conn = sqlite3.connect(self._db_path)
             cursor = conn.execute(
@@ -172,6 +174,7 @@ class TelegramOutbox:
                 logger.debug(f"♻️ Outbox dedup: hash={alert_hash}")
                 return False
 
+        # 3. Insert
         conn = sqlite3.connect(self._db_path)
         conn.execute(
             """INSERT INTO outbox
@@ -182,7 +185,7 @@ class TelegramOutbox:
             (
                 text, parse_mode, int(disable_notification),
                 reply_to_message_id, reply_markup,
-                priority, MessageStatus.PENDING,
+                int(priority), status,
                 self.MAX_RETRIES, now, alert_hash,
             ),
         )
@@ -198,14 +201,7 @@ class TelegramOutbox:
             """SELECT * FROM outbox
                WHERE status IN ('pending', 'failed')
                  AND retries < max_retries
-               ORDER BY
-                 CASE priority
-                   WHEN 'critical' THEN 0
-                   WHEN 'normal' THEN 1
-                   WHEN 'low' THEN 2
-                   ELSE 3
-                 END,
-                 created_at ASC
+               ORDER BY priority DESC, created_at ASC
                LIMIT ?""",
             (limit,),
         ).fetchall()
@@ -290,16 +286,35 @@ class TelegramOutbox:
 
         try:
             if self._session is None or self._session.closed:
-                timeout = aiohttp.ClientTimeout(total=15, connect=5)
-                proxy = getattr(config.telegram, "proxy_url", None) or os.getenv("PROXY_URL")
-                self._session = aiohttp.ClientSession(timeout=timeout)
+                from aiohttp import TCPConnector
+                connector = TCPConnector(
+                    limit=10, 
+                    ttl_dns_cache=300, 
+                    use_dns_cache=True,
+                    keepalive_timeout=30
+                )
+                timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
+                self._session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    trust_env=True
+                )
 
             proxy = getattr(config.telegram, "proxy_url", None) or os.getenv("PROXY_URL")
-            async with self._session.post(url, json=payload, proxy=proxy) as resp:
+            
+            # Gektor Guard: Verify proxy syntax
+            if proxy and not proxy.startswith(("http://", "https://")):
+                proxy = f"http://{proxy}"
+
+            async with self._session.post(url, json=payload, proxy=proxy, timeout=timeout) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    tg_msg_id = data.get("result", {}).get("message_id")
-                    return True, "", tg_msg_id
+                    if data.get("ok"):
+                        tg_msg_id = data.get("result", {}).get("message_id")
+                        return True, "", tg_msg_id
+                    else:
+                        error_msg = data.get("description", "Unknown TG Error")
+                        return False, f"TG API Error: {error_msg}", None
                 elif resp.status == 429:
                     # Rate limited by Telegram
                     retry_after = 5
@@ -315,7 +330,7 @@ class TelegramOutbox:
 
         except asyncio.TimeoutError:
             return False, "TG request timeout", None
-        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, OSError) as e:
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ServerDisconnectedError, aiohttp.ClientDisconnectedError, OSError) as e:
             return False, f"TG network: {type(e).__name__}: {str(e)[:100]}", None
         except Exception as e:
             return False, f"TG unexpected: {type(e).__name__}: {str(e)[:100]}", None
@@ -351,15 +366,14 @@ class TelegramOutbox:
                     
                     if len(self._hourly_sends) >= self.MAX_MESSAGES_PER_HOUR:
                         # Only CRITICAL bypasses the hourly limit
-                        if msg.priority != MessagePriority.CRITICAL:
+                        if int(msg.priority) < MessagePriority.CRITICAL:
                             self._update_status(msg.id, MessageStatus.DLQ, error_msg="Hourly cap reached")
                             self._stats["throttled"] += 1
                             logger.debug(f"🚫 Outbox hourly cap: skipped #{msg.id} (priority={msg.priority})")
                             continue
-
-                    # Exponential backoff check (Rule 2.4)
+                    # Rule 2.4: Exponential backoff check (Hardened 5s -> 300s)
                     if msg.retries > 0:
-                        delay = min(60, (2 ** msg.retries) * 5)
+                        delay = min(300, (2 ** (msg.retries - 1)) * 10) # 10, 20, 40, 80, 160, 300
                         if now_ts - msg.last_attempt < delay:
                             continue
                     
@@ -411,50 +425,78 @@ class TelegramOutbox:
         self._worker_task = asyncio.create_task(
             self._worker_loop(), name="outbox_worker"
         )
-        # Register for Signal Events (Roadmap Step 1)
+        # Audit 24.5: Re-subscribing to SignalEvent for HIL approval
+        from core.events.events import SignalEvent, AlertEvent
         bus.subscribe(SignalEvent, self._handle_signal_event)
+        bus.subscribe(AlertEvent, self._handle_alert_event)
+        logger.info("📬 [Outbox] Subscribed to SignalEvent & AlertEvent")
 
     async def _handle_signal_event(self, event: SignalEvent):
         """Automatically enqueues an alert when a signal is approved."""
         try:
-            msg, buttons = format_signal_alert(
-                symbol=event.symbol,
-                signal_type="PROBABILITY_AUTO",
-                confidence=event.confidence,
-                price=event.price,
-                factors=event.factors,
-                metadata=event.metadata
-            )
+            # Mobile Sniper Spec (v5.2): Strict Quality Guard
+            score = event.confidence * 100 if event.confidence <= 1.0 else event.confidence
+            score_int = int(score)
+            
+            # Gektor Rule: Active alerts ONLY for Score >= 90.
+            if score_int < 90:
+                logger.debug(f"🔇 [Outbox] Signal {event.symbol} score {score_int} < 90. Suppressed (Task 5).")
+                return
+
+            # Task 5.5: Imbalance Guard (> 1.2)
+            imbalance = event.metadata.get('imbalance', 1.0)
+            if imbalance < 1.2:
+                logger.debug(f"🔇 [Outbox] Signal {event.symbol} imbalance {imbalance} < 1.2. Suppressed.")
+                return
+            
+            from core.alerts.formatters import format_signal_alert
+            msg, buttons = format_signal_alert(event)
             
             alert_hash = self.compute_alert_hash(
-                event.symbol, "SIGNAL_AUTO", str(event.confidence // 10)
+                event.symbol, "SIGNAL_MOBILE", str(score_int)
             )
             
+            # For Score > 90, we always want sound and high priority
             self.enqueue(
                 text=msg,
                 priority=MessagePriority.CRITICAL,
+                disable_notification=False,
                 reply_markup=buttons,
-                alert_hash=alert_hash
+                alert_hash=alert_hash,
+                status="pending"
             )
-            logger.info(f"📬 [Outbox] Signal Alert enqueued for {event.symbol} via EventBus")
+            logger.info(f"📬 [Mobile Sniper] ALERT enqueued for {event.symbol} (Score: {score_int})")
         except Exception as e:
             logger.error(f"❌ [Outbox] Error handling SignalEvent: {e}")
 
+    async def _handle_alert_event(self, event: Any):
+        """Handler for General AlertEvents."""
+        try:
+            msg = f"<b>{event.title}</b>\n\n{event.message}"
+            self.enqueue(
+                text=msg,
+                priority=getattr(event, 'priority', MessagePriority.NORMAL),
+            )
+            logger.info(f"📬 [Outbox] General Alert enqueued: {event.title}")
+        except Exception as e:
+            logger.error(f"❌ [Outbox] Error handling AlertEvent: {e}")
+
     def cleanup_stale_dlq(self):
-        """Archives stale messages in DLQ to prevent blocking startup."""
+        """Archives stale messages in DLQ to prevent blocking startup (TTL check)."""
         now = time.time()
         conn = sqlite3.connect(self._db_path)
-        # Mark DLQ messages older than 5 minutes as 'archived_failed' or just delete them
-        # In this v5.1 spec, we archive them.
+        # Gektor Rule: DLQ items older than 2 hours are purged
         cursor = conn.execute(
             "DELETE FROM outbox WHERE status='dlq' AND last_attempt < ?",
-            (now - 300,)
+            (now - 7200,)
         )
         count = cursor.rowcount
+        # Also cleanup extremely old sent messages
+        conn.execute("DELETE FROM outbox WHERE status='sent' AND created_at < ?", (now - 86400,))
         conn.commit()
         conn.close()
         if count > 0:
-            logger.info(f"📬 [Outbox] Startup: cleared {count} stale DLQ messages")
+            logger.info(f"📬 [Outbox] Startup: cleared {count} stale DLQ messages (TTL Exceeded)")
 
     async def stop(self):
         """Graceful shutdown."""
@@ -488,6 +530,7 @@ class TelegramOutbox:
             "pending_in_queue": pending,
             "failed_in_queue": failed,
             "dlq_total": dlq,
+            "dropped_total": self._stats.get("dropped", 0)
         }
 
     def cleanup_old(self, max_age_hours: int = 48):

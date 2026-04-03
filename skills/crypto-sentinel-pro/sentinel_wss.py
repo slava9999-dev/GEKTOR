@@ -48,6 +48,10 @@ def send_telegram_alert_async(message: str, tg_config: Dict[str, Any]) -> None:
 
     # Fire and forget request to not block websocket loop
     try:
+        proxies = None
+        proxy_url = os.getenv("PROXY_URL")
+        if proxy_url:
+            proxies = {"http": proxy_url, "https": proxy_url}
         # We use sync requests here but run in a separate thread if needed, or simply let it run quickly since it's an alert
         loop = asyncio.get_event_loop()
         loop.run_in_executor(
@@ -56,6 +60,7 @@ def send_telegram_alert_async(message: str, tg_config: Dict[str, Any]) -> None:
                 url,
                 json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
                 timeout=5,
+                proxies=proxies
             ),
         )
     except Exception as e:
@@ -130,7 +135,11 @@ class WSSentinel:
     def fetch_top_symbols(self) -> List[str]:
         url = "https://api.bybit.com/v5/market/tickers?category=linear"
         try:
-            r = requests.get(url, timeout=10)
+            proxies = None
+            proxy_url = os.getenv("PROXY_URL")
+            if proxy_url:
+                proxies = {"http": proxy_url, "https": proxy_url}
+            r = requests.get(url, timeout=10, proxies=proxies)
             if r.status_code == 200:
                 data = r.json()
                 if data.get("retCode") == 0:
@@ -156,6 +165,19 @@ class WSSentinel:
         primary_url = self.wss_url
         fallback_url = "wss://stream.bytick.com/v5/public/linear"
         current_url = primary_url
+
+        proxy_url = os.getenv("PROXY_URL")
+        # Ensure proxy url looks like http://host:port for proxy library, but websockets library accepts HTTP proxy if requested. 
+        # For websockets directly it requires a specific proxy handling or custom connector, but since websockets library in python doesn't officially support HTTP proxy connecting directly via client.connect kwargs smoothly in all versions, we'll try configuring it if supported, or pass aiohttp session. 
+        # websockets client does NOT support native proxy argument directly. A helper or different library is usually needed.
+        # But wait! websockets.client support proxy since version 14.0 or via aiohttp... Actually, standard websockets only supports HTTP_PROXY environment variables by default. 
+        # BUT Bybit websocket is wss://. Let's rely on standard OS env vars which websockets respects if httpx/aiohttp is used, OR if we need raw support we modify env inside script.
+        
+        # Let's set env vars for proxy so `websockets` may pick it up automatically if compiled with proxy support, or use aiohttp instead if possible... Sentinel uses `websockets` lib.
+        if proxy_url:
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            logger.info(f"Using proxy for WSS: {proxy_url}")
 
         while True:
             try:

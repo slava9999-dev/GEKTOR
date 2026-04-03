@@ -9,68 +9,83 @@ try:
 except ImportError:
     SmartRouter = None
 
+import os
+import sys
+
+# Add skills dir to path so we can import gerald-super-analyst
+skills_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if skills_dir not in sys.path:
+    sys.path.append(skills_dir)
+    
+sys.path.append(os.path.join(skills_dir, "gerald-super-analyst"))
+
+try:
+    from schemas import SignalContext, LevelContext, BTCContext, RadarV2Context
+    from analyst import SuperAnalyst
+except ImportError as e:
+    logger.error(f"Failed to import SuperAnalyst schemas: {e}")
+    SuperAnalyst = None
+
 class MarketAnalysisOutput(BaseModel):
     summary: str
     sentiment: str  # BULLISH, BEARISH, NEUTRAL
-
-class SignalAnalysisOutput(BaseModel):
-    conviction: int
-    recommendation: str
-    reasoning: str
 
 class GeraldSniperAnalyst:
     """
     Complex AI Market Analysis using Cloud Router.
     Analyzes the top hot coins from the Radar and provides a smart summary.
     """
-    def __init__(self):
+    def __init__(self, router=None):
         self.enabled = False
-        if SmartRouter is None:
-            logger.warning("SmartRouter not found. AI Analyst is disabled.")
-            return
-
-        llm_config = {
-            "sanitizer": False,
-            "providers": {
-                "deepseek": {
-                    "enabled": False,  # Disabled: insufficient balance
-                    "api_key_env": "DEEPSEEK_API_KEY",
-                    "base_url": "https://api.deepseek.com/v1",
-                    "model": "deepseek-chat",
-                    "rpm": 60,
-                    "supports_strict_schema": False,
-                    "supports_json_object": True
-                },
-                "gpt4o_mini": {
-                    "enabled": True,
-                    "api_key_env": "OPENROUTER_API_KEY",
-                    "base_url": "https://openrouter.ai/api/v1",
-                    "model": "openai/gpt-4o-mini",
-                    "rpm": 60,
-                    "supports_strict_schema": False,
-                    "supports_json_object": True,
-                    "extra_body": {
-                        "provider": {
-                            "order": ["OpenAI"],
-                            "ignore": ["Azure"],
-                            "allow_fallbacks": True,
-                        },
-                        "route": "fallback",
-                    }
-                }
-            },
-            "routing": {
-                "simple": {"primary": "gpt4o_mini", "fallback": "gpt4o_mini", "emergency": "gpt4o_mini"},
-                "agent":  {"primary": "gpt4o_mini", "fallback": "gpt4o_mini", "emergency": "gpt4o_mini"},
-                "deep":   {"primary": "gpt4o_mini", "fallback": "gpt4o_mini", "emergency": "gpt4o_mini"}
-            }
-        }
+        self.router = router
         
-        self.router = SmartRouter(llm_config)
-        self.enabled = True
+        if self.router is None:
+            if SmartRouter is None:
+                logger.warning("SmartRouter not found. AI Analyst is disabled.")
+                return
+
+            llm_config = {
+                "sanitizer": False,
+                "providers": {
+                    "gpt4o_mini": {
+                        "enabled": True,
+                        "api_key_env": "OPENROUTER_API_KEY",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "model": "openai/gpt-4o-mini",
+                        "rpm": 60,
+                        "supports_strict_schema": False,
+                        "supports_json_object": True
+                    }
+                },
+                "routing": {
+                    "simple": {"primary": "gpt4o_mini", "fallback": "gpt4o_mini", "emergency": "gpt4o_mini"},
+                    "agent":  {"primary": "gpt4o_mini", "fallback": "gpt4o_mini", "emergency": "gpt4o_mini"},
+                    "deep":   {"primary": "gpt4o_mini", "fallback": "gpt4o_mini", "emergency": "gpt4o_mini"}
+                }
+            }
+            self.router = SmartRouter(llm_config)
+
+        # Check if the router has the required LLM methods
+        if hasattr(self.router, "generate_structured"):
+            self.super_analyst = SuperAnalyst(self.router) if SuperAnalyst else None
+            self.enabled = True
+            logger.info("🧠 [AI Analyst] Smart Connection established.")
+        else:
+            logger.warning("⚠️ [AI Analyst] Router provided but lacks LLM methods. AI features limited.")
+            self.enabled = False
+
+    def configure(self, router):
+        """Re-configures the analyst with a new router (e.g. from ExecutionEngine)."""
+        self.router = router
+        if hasattr(self.router, "generate_structured"):
+            self.super_analyst = SuperAnalyst(self.router) if SuperAnalyst else None
+            self.enabled = True
+            logger.info("🧠 [AI Analyst] Re-configured with Smart Router.")
+        else:
+            logger.warning("⚠️ [AI Analyst] Configuration failed: Provided router lacks LLM capabilities.")
 
     async def analyze_hot_coins(self, top_coins: list) -> str:
-        if not self.enabled:
+        if not self.enabled or not hasattr(self.router, "generate_structured"):
             return ""
             
         try:
@@ -80,11 +95,19 @@ class GeraldSniperAnalyst:
                 "Вот топ монет, которые сейчас пульсируют на радаре по объему и ATR:\n"
             )
             for c in top_coins[:10]:
-                prompt += f"- {c['metrics'].symbol}: Score {c['score']:.1f}, Volume {c['metrics'].volume_24h_usd/1e6:.1f}M, ATR {c['metrics'].atr_pct:.1f}%\n"
+                m = c['metrics']
+                # Radar v2 metrics
+                prompt += (
+                    f"- {m.symbol}: Score {m.final_score}, "
+                    f"Spike {m.volume_spike:.1f}x, "
+                    f"Velocity {m.velocity:.1f}t/m, "
+                    f"Mom {m.momentum_pct:.1f}%, "
+                    f"ATR Ratio {m.atr_ratio:.2f}\n"
+                )
             
             prompt += (
                 "\nНапиши ОЧЕНЬ КОРОТКОЕ (1-2 предложения) резюме для трейдера в Telegram.\n"
-                "Укажи, где сейчас максимальный перегрев или интерес. "
+                "Оцени общее состояние рынка по этим аномалиям. "
                 "Используй иконки 💰🔥."
             )
 
@@ -116,49 +139,74 @@ class GeraldSniperAnalyst:
             logger.error(f"AI Analyst error: {e}")
             return ""
 
-    async def analyze_signal(self, symbol: str, level: dict, trigger: dict, score: int, risk_data: dict, btc_ctx: dict) -> dict | None:
-        if not self.enabled:
-            return None
+    async def analyze_signal(self, symbol: str, level: dict, trigger: dict, score: int, direction: str, sym_data: dict, btc_ctx: dict, alert_id: int | None):
+        if not self.enabled or not self.super_analyst:
+            return None, None
             
         try:
-            prompt = (
-                f"Ты — Gerald Sniper, элитный крипто-трейдер.\n"
-                f"Твоя задача — проанализировать сетап и дать четкую рекомендацию.\n"
-                f"Монета: {symbol}\n"
-                f"Направление (Тип): {trigger.get('direction', 'UNKNOWN')}\n"
-                f"Паттерн: {trigger.get('pattern', 'UNKNOWN')} (score {score}/100)\n"
-                f"Описание: {trigger.get('description', '')}\n"
-                f"Уровень: {level.get('price')} (touches {level.get('touches')})\n"
-                f"Дистанция до уровня: {level.get('distance_pct')}%\n"
-                f"Stop Loss: {risk_data.get('stop_pct')}%\n"
-                f"Контекст BTC: {btc_ctx.get('trend')} (1h: {btc_ctx.get('change_1h')}%, 4h: {btc_ctx.get('change_4h')}%)\n\n"
-                "Выдай JSON в строгом формате:\n"
-                "- conviction: целое число от 1 до 10 (твоя уверенность в сделке, где 10 - верняк)\n"
-                "- recommendation: одно из значений: TAKE, WAIT, SKIP\n"
-                "- reasoning: 1 очень короткое предложение почему (максимум 100 символов, без воды).\n"
-            )
-
-            import asyncio
-            try:
-                result = await asyncio.wait_for(
-                    self.router.generate_structured(
-                        prompt=prompt,
-                        response_model=SignalAnalysisOutput,
-                        task_type="simple"
-                    ),
-                    timeout=15.0
+            radar_v2 = sym_data.get('radar')  # This should be RadarV2Metrics
+            atr_pct = 2.0  # Default fallback
+            radar_ctx = None
+            
+            if radar_v2:
+                # Calculate approximate ATR % for context if needed, though atr_ratio is better
+                # We can use a default or try to get it from candles
+                radar_ctx = RadarV2Context(
+                    volume_spike=radar_v2.volume_spike,
+                    velocity=radar_v2.velocity,
+                    momentum_pct=radar_v2.momentum_pct,
+                    atr_ratio=radar_v2.atr_ratio,
+                    final_score=radar_v2.final_score
                 )
-                return {
-                    "conviction": result.conviction,
-                    "recommendation": result.recommendation.upper(),
-                    "reasoning": result.reasoning
+                # For backward compatibility in SignalContext.atr_pct
+                # We can estimate it or just use a fixed value if it's not critical
+                # Actually, RadarV2Metrics doesn't have raw atr_pct anymore
+                # But we can pass atr_ratio * normal_atr if we had it.
+                # Let's keep it simple for now.
+            
+            context = SignalContext(
+                symbol=symbol,
+                direction=direction,
+                trigger=trigger.get('pattern', 'UNKNOWN'),
+                score=score,
+                level=LevelContext(
+                    price=level.get('price'),
+                    type=level.get('type'),
+                    source=level.get('source', 'UNKNOWN'),
+                    touches=level.get('touches', 1),
+                    distance_pct=level.get('distance_pct', 0.0)
+                ),
+                btc_context=BTCContext(
+                    trend=btc_ctx.get('trend', 'FLAT'),
+                    change_1h=btc_ctx.get('change_1h', 0.0),
+                    change_4h=btc_ctx.get('change_4h', 0.0)
+                ),
+                radar=radar_ctx,
+                candles_m5=sym_data.get('m5', []),
+                candles_m15=sym_data.get('m15', []),
+                atr_pct=atr_pct
+            )
+            
+            plan = await self.super_analyst.analyze_signal(context)
+            if not plan:
+                return None, None
+                
+            reply_msg = self.super_analyst.format_telegram_alert(plan)
+            
+            markup = None
+            if alert_id and plan.verdict in ("TAKE", "WAIT"):
+                markup = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "✅ TAKE PLAN", "callback_data": f"/take_{alert_id}"},
+                            {"text": "❌ SKIP", "callback_data": f"/skip_{alert_id}"}
+                        ]
+                    ]
                 }
-            except asyncio.TimeoutError:
-                logger.warning(f"LLM SignalAnalysis timed out for {symbol}.")
-                return None
+            return reply_msg, markup
             
         except Exception as e:
             logger.error(f"AI Analyst signal error: {e}")
-            return None
+            return None, None
 
 analyst = GeraldSniperAnalyst()

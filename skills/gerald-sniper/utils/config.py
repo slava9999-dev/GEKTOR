@@ -20,6 +20,7 @@ class BybitConfig(BaseModel):
     rest_url_fallback: str = "https://api.bytick.com"
     ws_url: str = "wss://stream.bybit.com/v5/public/linear"
     ws_url_fallback: str = "wss://stream.bytick.com/v5/public/linear"
+    ws_url_private: str = "wss://stream.bybit.com/v5/private"
     fallback_switch_after_failures: int = 3
     fallback_primary_recheck_sec: int = 600
     ws_ping_interval_sec: int = 18
@@ -222,6 +223,34 @@ class StatisticsConfig(BaseModel):
     min_acceptable_winrate: float = 0.40
     min_alerts_per_month: int = 10
 
+class OrchestratorConfig(BaseModel):
+    min_detectors: int = 2
+    min_detectors_per_signal: int = 1
+    min_score: int = 60
+    max_distance_percent: float = 1.5
+    max_distance_to_level: float = 0.5 # Legacy fallback
+    confluence_window_seconds: int = 60
+    signal_ttl_minutes: int = 10
+    signal_timeout_minutes: int = 15
+
+class ExecutionConfig(BaseModel):
+    mode: str = "paper"
+    risk_percent: float = 1.5
+    default_tp_percent: float = 5.0
+    default_sl_percent: float = 3.0
+    hedge_enabled: bool = False
+    max_slippage_pct: float = 0.15
+
+class MacroRadarConfig(BaseModel):
+    """[GEKTOR v8.2] MacroRadar — Macro Anomaly Scanner config."""
+    enabled: bool = True
+    scan_interval_sec: int = 60
+    min_turnover_24h_usd: float = 5_000_000
+    min_rvol: float = 3.0
+    min_oi_delta_pct: float = 5.0
+    alert_cooldown_sec: int = 300
+    max_signals_per_cycle: int = 5
+
 class SniperConfig(BaseSettings):
     bybit: BybitConfig = Field(default_factory=BybitConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
@@ -236,7 +265,13 @@ class SniperConfig(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     statistics: StatisticsConfig = Field(default_factory=StatisticsConfig)
+    orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    macro_radar: MacroRadarConfig = Field(default_factory=MacroRadarConfig)
     timezone: str = "Europe/Moscow"
+    trading_mode: str = "paper" # paper, live, ghost
+    watchlist: list[str] = Field(default_factory=list, description="Static watchlist for monitoring")
+
     
     @classmethod
     def load(cls, config_path: str = "config_sniper.yaml") -> "SniperConfig":

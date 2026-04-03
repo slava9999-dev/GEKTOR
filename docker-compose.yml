@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # ХРАНИЛИЩЕ: TimescaleDB для тиков, свечей и стейта ордеров
+  blackbox_db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: tekton_blackbox
+    restart: always
+    environment:
+      - POSTGRES_USER=tekton_admin
+      - POSTGRES_PASSWORD=CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912
+      - POSTGRES_DB=tekton_alpha
+    ports:
+      - "127.0.0.1:5433:5432"
+    cpuset: "0-1"
+    volumes:
+      - tekton_pgdata_v2:/var/lib/postgresql/data
+
+  # ШИНА: Redis (Hardened Persistence for AOF/Idempotency)
+  nerve_center:
+    image: redis:7-alpine
+    container_name: tekton_nerve_center
+    restart: always
+    ports:
+      - "127.0.0.1:6381:6379"
+    cpuset: "0-1"
+    # [Hardened] --appendonly yes + --appendfsync everysec ensures maximum durability 
+    # while maintaining HFT-level performance (Task 25.11).
+    command: redis-server --appendonly yes --appendfsync everysec --loglevel warning --requirepass CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912
+    volumes:
+      - tekton_redis_data_v2:/data
+
+volumes:
+  tekton_pgdata_v2: # Versioned for v6.27 state migration
+  tekton_redis_data_v2:

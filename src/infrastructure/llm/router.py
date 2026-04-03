@@ -6,13 +6,17 @@ from loguru import logger
 
 from .providers.base_provider import LLMProvider, ProviderError, RateLimitExceeded
 from .providers.openai_compat import OpenAICompatProvider
-from .providers.local_provider import LocalProvider
+from .providers.gemini_provider import GeminiProvider
+try:
+    from .providers.local_provider import LocalProvider
+except ImportError:
+    LocalProvider = None
 from .security.sanitizer import SecureContextSanitizer
 
 class SmartRouter:
     """
     Tiered routing architecture for LLMs.
-    Prioritizes fast cloud models, filters secrets, and falls back to local hardware.
+    Prioritizes Gemini/DeepSeek for complex tasks, with local/openai fallbacks.
     """
 
     def __init__(self, config: dict):
@@ -21,6 +25,9 @@ class SmartRouter:
         self.providers: Dict[str, LLMProvider] = {}
         self.routing = config.get("routing", {})
         
+        # [NERVE REPAIR v4.5] Local Inference Guard
+        # Prevents CUDA Out of Memory (OOM) by ensuring only 1 local request runs at a time.
+        self._local_semaphore = asyncio.Semaphore(1)
         self._local_active = False
 
         self._init_providers(config.get("providers", {}))
@@ -32,7 +39,21 @@ class SmartRouter:
                 continue
 
             if name == "local":
-                self.providers[name] = LocalProvider(pconf)
+                if LocalProvider:
+                    self.providers[name] = LocalProvider(pconf)
+                else:
+                    logger.warning("LocalProvider cannot be enabled: dependencies (llama-cpp-python) missing.")
+
+            elif name == "gemini":
+                api_key_env = pconf.get("api_key_env", "GEMINI_API_KEY")
+                actual_key = os.getenv(api_key_env)
+                if actual_key:
+                    self.providers[name] = GeminiProvider(
+                        api_key=actual_key, config=pconf, name=name
+                    )
+                else:
+                    logger.warning(f"Provider {name} enabled, but '{api_key_env}' not found in .env. Skipping.")
+
             else:
                 api_key_env = pconf.get("api_key_env", "")
                 actual_key = os.getenv(api_key_env)
@@ -91,7 +112,7 @@ class SmartRouter:
 
         for idx, provider_name in enumerate(route):
             provider = self.providers[provider_name]
-            is_local = isinstance(provider, LocalProvider)
+            is_local = LocalProvider and isinstance(provider, LocalProvider)
             cloud = not is_local
 
             # Only sanitize cloud payloads
@@ -104,13 +125,30 @@ class SmartRouter:
                 logger.debug(f"Router | Skipped {provider_name} due to RPM exhaustion.")
                 continue
 
+            import time
+            wait_start = time.time()
             try:
-                # Execution
-                result = await provider.generate_structured(
-                    messages=send_messages,
-                    response_model=response_model,
-                    max_tokens=max_tokens if cloud else min(max_tokens, 1024),
-                )
+                # [NERVE REPAIR v4.5] VRAM Concurrency Isolation with Signal TTL (30s)
+                if is_local:
+                    async with self._local_semaphore:
+                        wait_time = time.time() - wait_start
+                        if wait_time > 30.0:
+                            logger.error(f"⏳ [Router] Local Task DECAYED (Waited {wait_time:.1f}s > 30s). Rejecting.")
+                            raise ProviderError(f"VRAM Queue Timeout: Signal is stale (Waited {wait_time:.1f}s)")
+
+                        logger.debug(f"Router | VRAM Locked. Queue wait: {wait_time:.3f}s. Serving request locally...")
+                        result = await provider.generate_structured(
+                            messages=send_messages,
+                            response_model=response_model,
+                            max_tokens=min(max_tokens, 1024),
+                        )
+                else:
+                    # Cloud calls are parallel
+                    result = await provider.generate_structured(
+                        messages=send_messages,
+                        response_model=response_model,
+                        max_tokens=max_tokens,
+                    )
 
                 # VRAM Memory Management
                 if self._local_active and cloud:

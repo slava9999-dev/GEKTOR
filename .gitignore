@@ -50,3 +50,9 @@ bridge/outbox/*.md
 models/
 memory/
 gerald_workspace/tmp_run/
+
+# GEKTOR Specific
+skills/gerald-sniper/data_run/
+skills/gerald-sniper/logs/
+*.db
+*.sqlite3

@@ -10,14 +10,25 @@
 
 ## Цель
 
-Подключить Gerald AI агент к базе данных Sniper-алертов, чтобы он мог:
+Подключить Gerald AI агент к базе данных Sniper-алертов и обеспечить стабильную работу **Tactical Orchestrator (v4.1)**.
 
-1. Анализировать качество сигналов (win rate, PnL)
-2. Проверять актив по фундаментальным метрикам перед ответом
-3. Давать рекомендации по калибровке порогов
-4. Генерировать еженедельные отчёты автоматически
+### ТЕКУЩИЙ СТАТУС (2026-03-15):
+- **Tactical Orchestrator**: 🟢 ACTIVE (Первые 7 APPROVED сигналов получены).
+- **Execution Engine**: 🟢 READY (TelegramOutbox исправлен, переход на `enqueue`).
+- **P0 Фиксы**: Исправлена загрузка конфига (1.5% distance) и Emergency Level Scan.
 
-## Задачи
+## Задачи (Sprint 1.3: Monitoring & Execution)
+
+### 0. Стабилизация дедупликации [URGENT]
+- Исправить пропуск дубликатов (сейчас ~30% сигналов дублируются).
+- Реализовать строгое окно (symbol, direction, detector) + 1-3 сек.
+
+### 1. Мониторинг Paper Trading [CRITICAL]
+- Проверить открытие первой реальной Paper-позиции.
+- Убедиться, что `PositionTracker` корректно подхватывает `alert_id` из Оркестратора.
+- Верифицировать Telegram-уведомления: `SIGNAL APPROVED` и `POSITION OPENED`.
+
+### 2. Подключить analytics к Gerald AI [HIGH]
 
 ### 1. Подключить insert_alert() в candle_manager.py [CRITICAL]
 

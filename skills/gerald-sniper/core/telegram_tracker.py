@@ -49,8 +49,14 @@ class TelegramOracle:
         async def cmd_stats(message: types.Message):
             if str(message.chat.id) != str(self.chat_id): return
             try:
+                # 1. Get DB stats (historical)
                 stats = await self.db.get_alert_stats(days=30)
-                msg_text = self._format_stats(stats)
+                
+                # 2. Get Live stats from tracker
+                from __main__ import trigger_pipeline
+                live = trigger_pipeline.tracker.get_stats()
+                
+                msg_text = self._format_stats(stats, live)
                 await message.answer(msg_text)
             except Exception as e:
                 logger.error(f"Error serving /stats: {e}")
@@ -108,9 +114,16 @@ class TelegramOracle:
             
             await message.reply(f"{emoji} <b>{symbol}</b> отмечен как <b>{result}</b>{pnl_str}\n<i>Сигнал от {row['timestamp'][:16]} (Уровень {row['level_price']})</i>")
 
-    def _format_stats(self, stats: dict) -> str:
+    def _format_stats(self, stats: dict, live: dict = None) -> str:
         s = f"📊 <b>Self-Calibration Stats (Last {stats['period_days']}d)</b>\n\n"
-        s += f"📈 Алертов всего: <b>{stats['total_alerts']}</b>\n"
+        
+        if live:
+            s += "<b>📡 Текущие позиции (Paper):</b>\n"
+            s += f"  • Открыто всего: <b>{live['total_open']}</b>\n"
+            s += f"  • LONG: {live['long_cnt']} | SHORT: {live['short_cnt']}\n"
+            s += f"  • Ср. время в сделке: {live['avg_hold_h']} ч.\n\n"
+
+        s += f"📈 Алертов в базе: <b>{stats['total_alerts']}</b>\n"
         
         if stats['win_rate_pct'] is not None:
             wr_emoji = "🟢" if stats['win_rate_pct'] >= 50 else "🔴"
@@ -125,6 +138,16 @@ class TelegramOracle:
             top3 = [f"{sym}" for sym, cnt in list(stats['top_symbols'].items())[:3]]
             s += f"\n🔥 Горячие монеты: {', '.join(top3)}\n"
             
+        if 'rejection_rate' in stats:
+            s += f"🚫 Rejection Rate: <b>{stats['rejection_rate']}%</b>\n"
+            
+        if 'detector_stats' in stats and stats['detector_stats']:
+            s += f"\n🎯 <b>Detector Accuracy:</b>\n"
+            # Sort by win rate
+            sorted_dets = sorted(stats['detector_stats'].items(), key=lambda x: x[1]['win_rate'], reverse=True)
+            for d, p in sorted_dets[:5]: # Top 5 detectors
+                s += f"  • {d}: {p['win_rate']}% WR ({p['total']} trades)\n"
+
         return s
 
     async def start(self):

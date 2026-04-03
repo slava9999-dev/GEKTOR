@@ -54,9 +54,36 @@ class DecisionEngine:
         if signal.volume_spike_ratio < self.min_vol_ratio:
             return False, f"Volume Spike low: {signal.volume_spike_ratio:.1f}x < {self.min_vol_ratio}x"
 
-        # 5. Spread Check (Опционально)
+        # 5. Spread Check (Critical for HFT impulsivity)
         if signal.spread_pct > 0.15:
-            return False, f"Spread too wide: {signal.spread_pct:.2f}%"
+            return False, f"Spread too wide: {signal.spread_pct:.2f}% (Safe < 0.15%)"
+
+        # 5.1 OB Imbalance (Spoofing Protection)
+        # HFT Quant: Ratio > 2.0x shows directional pressure
+        min_ob_imbalance = self.config.get("min_ob_imbalance", 2.0)
+        if signal.ob_imbalance < min_ob_imbalance:
+             return False, f"Low Order Book Imbalance: {signal.ob_imbalance:.1f}x < {min_ob_imbalance}x"
+
+        # 5.2 CVD Convergence Filter (The Fact Check)
+        # HFT Quant: CVD must support direction UNLESS Absorption is detected.
+        # Absorption = Takers are selling but Price is NOT falling (Iceberg Buying).
+        if signal.direction == "LONG" and signal.cvd_delta < 0:
+            if not signal.is_absorption:
+                return False, f"CVD Divergence: Bids are high but Takers are SELLING (CVD: {signal.cvd_delta:,.0f})"
+            else:
+                logger.info(f"💎 [Signal {signal.symbol}] Bullish Absorption Detected! Ignoring negative CVD.")
+                signal.execution_type = "LIMIT"
+                signal.entry_price = signal.best_bid # Entry at the Iceberg
+                signal.initial_iceberg_vol = getattr(signal, 'best_bid_volume', 0.0) # Snapshot for Decay Monitoring
+        
+        if signal.direction == "SHORT" and signal.cvd_delta > 0:
+            if not signal.is_absorption:
+                return False, f"CVD Divergence: Asks are high but Takers are BUYING (CVD: {signal.cvd_delta:,.0f})"
+            else:
+                logger.info(f"💎 [Signal {signal.symbol}] Bearish Absorption Detected! Ignoring positive CVD.")
+                signal.execution_type = "LIMIT"
+                signal.entry_price = signal.best_ask
+                signal.initial_iceberg_vol = getattr(signal, 'best_ask_volume', 0.0)
 
         # 6. Priority Age (Опционально)
         if signal.priority_age_sec > 900: # 15 min

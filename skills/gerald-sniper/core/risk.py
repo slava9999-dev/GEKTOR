@@ -2,7 +2,7 @@ from typing import Dict, Any
 from utils.safe_math import safe_float
 
 def calculate_stop_and_target(
-    sym_data: dict, symbol: str, level: dict, direction: str, config: Any
+    sym_data: dict, symbol: str, level: dict, direction: str, config: Any, score: int = 50, bd: dict = None
 ) -> Dict[str, float]:
     """
     Рассчитывает стоп, цель и размер позиции на основе реального ATR монеты.
@@ -52,9 +52,41 @@ def calculate_stop_and_target(
         stop_price = current_price + stop_distance
         target_price = current_price - (stop_distance * rr)
     
-    # Размер позиции
-    risk_usd = getattr(config.risk, 'risk_per_trade_usd', 20) if hasattr(config, 'risk') else 20
-    position_size = risk_usd / (stop_pct / 100) if stop_pct > 0 else 0
+    # Агрессивное масштабирование позиции (Risk scaling)
+    from core.neural import aggressive_risk
+    bd = bd or {}
+    neural_confidence = score / 100.0
+    sentiment_alignment = bd.get('sentiment_bullish', 50)/100 if direction == 'LONG' else bd.get('sentiment_bearish', 50)/100
+    risk_usd_base = getattr(config.risk, 'risk_per_trade_usd', 20) if hasattr(config, 'risk') else 20
+    
+    # [HIVE MIND] Extract swarm state from breakdown
+    swarm_state = "NONE"
+    if bd.get('pattern', '').startswith('SWARM_SYNC'):
+        swarm_state = "SYNC"
+    elif bd.get('pattern', '').startswith('SWARM_CONFLICT'):
+        swarm_state = "CONFLICT"
+        # Для скальпа при конфликте ставим очень короткий стоп и быстрый тейк
+        stop_pct *= 0.5
+        stop_distance = current_price * (stop_pct / 100)
+        rr = 1.2
+        if direction == 'LONG':
+            stop_price = current_price - stop_distance
+            target_price = current_price + (stop_distance * rr)
+        else:
+            stop_price = current_price + stop_distance
+            target_price = current_price - (stop_distance * rr)
+            
+    volatility = getattr(sym_data.get('radar'), 'atr_pct', 2.0) if sym_data.get('radar') else 2.0
+    
+    final_risk_usd = aggressive_risk.calculate_position_size(
+        neural_confidence=neural_confidence,
+        sentiment_alignment=sentiment_alignment,
+        volatility=volatility,
+        base_risk_usd=risk_usd_base,
+        swarm_state=swarm_state
+    )
+    
+    position_size = final_risk_usd / (stop_pct / 100) if stop_pct > 0 else 0
     
     return {
         'stop_pct': round(stop_pct, 2),

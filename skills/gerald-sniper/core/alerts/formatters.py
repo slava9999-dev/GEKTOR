@@ -22,7 +22,8 @@ Alert Types:
 """
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
+from core.events.events import SignalEvent
 
 from core.alerts.models import AlertEvent, AlertType
 
@@ -134,70 +135,78 @@ def format_alert_to_telegram(event: AlertEvent) -> tuple[str, Optional[str]]:
 #  Signal Alerts (from SignalEngine confluence)
 # ─────────────────────────────────────────────────
 
-def format_signal_alert(
-    symbol: str,
-    signal_type: str,
-    confidence: int,
-    price: float,
-    factors: set,
-    metadata: dict = None,
-) -> tuple[str, str]:
+def format_signal_alert(event: SignalEvent) -> tuple[str, str]:
     """
-    Formats a high-confidence confluence signal for Telegram.
-    This is the MAIN alert type that users see.
+    Mobile Sniper Interface v5.2 (Pilot Spec).
+    Optimized for Russian mobile trading with Deep Links & Latency Guards.
     
     Returns: (message_text, reply_markup_json)
     """
-    metadata = metadata or {}
+    m = event.metadata or {}
+    now = time.time()
+    generated_at = event.timestamp
+    age_sec = int(now - generated_at)
     
-    # Map signal type to Russian header
-    header_map = {
-        "MOMENTUM_BREAKOUT": "🚀 СИЛЬНЫЙ ИМПУЛЬС",
-        "ORDERFLOW_PRESSURE": "🔥 АНОМАЛЬНЫЙ ОБЪЁМ",
-        "VOLATILE_REVERSAL": "⚡ РАННЕЕ УСКОРЕНИЕ",
-    }
-    header = header_map.get(signal_type, "🚀 СИЛЬНЫЙ ИМПУЛЬС")
+    # 1. Visual Coding (Emojis)
+    score = int(event.confidence * 100) if event.confidence <= 1.0 else int(event.confidence)
+    color_emoji = "🔥" if score >= 95 else "✅" if score >= 85 else "⚠️"
     
-    # Build market description (human-readable)
-    description = _build_market_description(signal_type, factors, metadata)
+    # 2. Latency Guard
+    time_str = datetime.fromtimestamp(generated_at).strftime("%H:%M:%S")
+    age_warn = ""
+    if age_sec > 60:
+        age_warn = " ⚠️ <b>ВХОД ОПАСЕН (Late)</b>"
     
-    # Build key metrics
-    metrics_lines = _build_metrics_lines(factors, metadata)
+    # 3. Deep Link Generation
+    bybit_link = f"https://www.bybit.com/trade/usdt/{event.symbol}"
     
-    # BTC context
-    btc_change = metadata.get("btc_change_pct", 0.0)
+    # 4. Metrics Translation
+    spike = m.get('spike', 1.0)
+    velocity = m.get('velocity', 1.0)
+    momentum = m.get('momentum', 0.0)
+    imbalance = m.get('imbalance', 1.0)
     
-    # Signal Confidence Scaling (Fix 0.75 -> 75)
-    display_conf = confidence if confidence > 1.0 else int(confidence * 100)
-    conf_label = _confidence_label(display_conf)
-    
-    price_str = _format_price(price)
-    
+    # 4.1 Critical Volume Header (Audit 19.4)
+    critical_header = ""
+    if imbalance > 3.0:
+        critical_header = "🚨 <b>[КРИТИЧЕСКИЙ ОБЪЕМ]</b>\n"
+
+    # Main Header & Quick Stats
     msg = (
-        f"<b>{header}</b>\n"
+        f"{critical_header}"
+        f"{color_emoji} <b>#{event.symbol} | СКОР: {score}</b>\n"
         f"\n"
-        f"<b>{symbol}</b>\n"
-        f"Цена: <code>{price_str}</code>\n"
+        f"🟢 <b>ВХОД (VWAP):</b> <code>{_format_price(event.price)}</code>\n"
+        f"🛑 <b>СТОП (SL):</b> <code>{_format_price(m.get('sl', 0))}</code>\n"
+        f"💰 <b>ЦЕЛЬ (TP):</b> <code>{_format_price(m.get('tp', 0))}</code>\n"
         f"\n"
-        f"{description}\n"
+        f"📊 <b>ПОЧЕМУ:</b>\n"
+        f"• 🧨 <b>Объем:</b> x{spike:.1f} ({'Кит зашел' if spike > 5.0 else 'Рост'})\n"
+        f"• ⚡ <b>Скорость:</b> {velocity:.1f} ({'Импульс' if velocity > 2.5 else 'Активность'})\n"
+        f"• ⚖️ <b>Дисбаланс:</b> {imbalance:.2f} ({int(imbalance)} пок. на 1 прод.)\n"
+        f"• 📈 <b>Импульс:</b> {momentum:+.1f}%\n"
         f"\n"
+        f"⏰ {time_str} ({age_sec}с назад){age_warn}\n"
+        f"🔗 <a href='{bybit_link}'>ОТКРЫТЬ НА BYBIT</a>\n"
+        f"\n"
+        f"<i>Gerald Sniper v5.2</i>"
     )
     
-    # Metrics
-    for line in metrics_lines:
-        msg += f"{line}\n"
+    # 5. Interactive Buttons
+    markup = {
+        "inline_keyboard": [[
+            {
+                "text": "⚡ ВХОД (Limit IOC)", 
+                "callback_data": f"exec|{event.symbol}|{event.price:.6f}|{event.signal_id}"
+            },
+            {
+                "text": "🚫 ПАС", 
+                "callback_data": f"pass|{event.signal_id}"
+            }
+        ]]
+    }
     
-    if btc_change != 0.0:
-        msg += f"Контекст BTC: {_btc_context_text(btc_change)}\n"
-    
-    msg += (
-        f"\n"
-        f"Уверенность сигнала: <b>{display_conf} / 100</b>\n"
-        f"<i>{conf_label}</i>"
-    )
-    
-    buttons = _chart_buttons(symbol)
-    return msg, buttons
+    return msg, json.dumps(markup)
 
 
 def _build_market_description(signal_type: str, factors: set, meta: dict) -> str:
@@ -494,6 +503,12 @@ def _format_trigger_v4(event: AlertEvent) -> tuple[str, Optional[str]]:
     elif raw_pattern in ("VOLUME_SPIKE",):
         header = "🔥 АНОМАЛЬНЫЙ ОБЪЁМ"
         desc = "Зафиксирован аномальный всплеск объёма\nвблизи ключевого уровня."
+    elif "SWARM_SYNC" in raw_pattern:
+        header = "🌊 СИНХРОНИЗАЦИЯ РОЯ"
+        desc = "Все таймфреймы бьют в одном направлении.\nАгрессивный залив объема (x3 Risk)."
+    elif "SWARM_CONFLICT" in raw_pattern:
+        header = "⚡ СКАЛЬП УЯЗВИМОСТИ"
+        desc = "Фреймы конфликтуют. Идеальный момент\nдля контр-трендового скальпинга (Tight Stop)."
     else:
         header = "🚀 СИЛЬНЫЙ ИМПУЛЬС"
         desc = "Обнаружено сильное движение\nвблизи ключевого уровня."
@@ -696,7 +711,7 @@ def format_approved_alert(signal) -> str:
         f"Направление: <b>{dir_ru}</b>\n"
         f"Цена входа: <code>{price_str}</code>\n"
         f"Причина: {factors_ru}\n"
-        f"Дист. до уровня: <b>{signal.level_distance_pct:.2f}%</b>\n"
+        f"Дист. до уровня: <b>{signal.level_distance_pct or 0.0:.2f}%</b>\n"
         f"Рынок: <b>{btc_ru}</b>\n"
         f"Уверенность: <b>{display_conf}/100</b>\n"
         f"<i>{conf_label}</i>\n\n"
@@ -704,41 +719,41 @@ def format_approved_alert(signal) -> str:
     )
     return msg
 
-def format_execution_alert(signal, alert_id: int) -> str:
-    """Formats the 'POSITION OPENED' alert in Russian."""
-    dir_emoji = "🚀" if signal.direction == "LONG" else "🔻"
-    dir_ru = "ЛОНГ" if signal.direction == "LONG" else "ШОРТ"
+def format_execution_alert(signal, alert_id: str, ghost: bool = False) -> str:
+    """Formats the 'POSITION OPENED' alert in Russian (Pilot Spec)."""
+    dir_emoji = "✅" if signal.direction == "LONG" else "🔻"
     price_str = _format_price(signal.entry_price or 0.0)
-    sl_str = _format_price(signal.stop_loss or 0.0)
-    tp_str = _format_price(signal.take_profit or 0.0)
-    
-    # Translate detectors to Russian
-    factors_ru = _translate_detectors(signal.detectors)
-    
-    # Score as human text
-    score_val = signal.radar_score or 0
-    if score_val >= 80:
-        score_label = "высокий"
-    elif score_val >= 60:
-        score_label = "средний"
-    elif score_val >= 40:
-        score_label = "низкий"
-    else:
-        score_label = "минимальный"
     
     msg = (
-        f"{dir_emoji} <b>ПОЗИЦИЯ ОТКРЫТА</b>\n\n"
-        f"Монета: <b>{signal.symbol}</b>\n"
-        f"Направление: <b>{dir_ru} {dir_emoji}</b>\n"
-        f"Вход: <code>{price_str}</code>\n"
-        f"Стоп: <code>{sl_str}</code>\n"
-        f"Цель: <code>{tp_str}</code>\n\n"
-        f"Причина: {factors_ru}\n"
-        f"Качество сигнала: <b>{score_label} ({score_val})</b>\n"
-        f"ID сделки: <b>#{alert_id}</b>\n\n"
-        f"<i>Gerald Sniper 🎯 В позиции</i>"
+        f"<b>Вход:</b> {dir_emoji} Позиция по <b>#{signal.symbol}</b> открыта по цене <code>{price_str}</code>.\n"
+        f"<i>Gerald Sniper v5.2</i>"
     )
     return msg
+
+def format_tp_alert(symbol: str, profit_pct: float, profit_usd: float) -> str:
+    """Formats 'Take Profit' alert."""
+    return (
+        f"💰 <b>Профит зафиксирован!</b> по <b>#{symbol}</b>\n"
+        f"Результат: <b>+{profit_pct:.2f}% (${profit_usd:.2f})</b>\n"
+        f"<i>Gerald Sniper v5.2</i>"
+    )
+
+def format_sl_alert(symbol: str, loss_pct: float, loss_usd: float) -> str:
+    """Formats 'Stop Loss' alert."""
+    return (
+        f"🛑 <b>Стоп-лосс сработал</b> по <b>#{symbol}</b>\n"
+        f"Результат: <b>-{abs(loss_pct):.2f}% (-${abs(loss_usd):.2f})</b>\n"
+        f"<i>Gerald Sniper v5.2</i>"
+    )
+
+def format_rejection_alert(symbol: str, reason: str) -> str:
+    """Formats 'Order Rejected' alert."""
+    return (
+        f"⚠️ <b>Вход по #{symbol} отменен:</b>\n"
+        f"Причина: {reason}\n"
+        f"<i>Gerald Sniper v5.2</i>"
+    )
+
 
 
 # ─────────────────────────────────────────────────
@@ -759,8 +774,18 @@ def _translate_detectors(detectors: list) -> str:
         "BREAK": "пробой уровня",
         "RETEST": "ретест уровня",
         "SWEEP": "снятие ликвидности",
+        "swarm": "hive mind (мульти-таймфрейм)",
     }
-    translated = [detector_map.get(d, d) for d in detectors]
+    
+    translated = []
+    for d in detectors:
+        if d.startswith("SWARM_SYNC"):
+            translated.append("синхронизация роя")
+        elif d.startswith("SWARM_CONFLICT"):
+            translated.append("излом таймфреймов")
+        else:
+            translated.append(detector_map.get(d, d))
+            
     return ", ".join(translated)
 
 

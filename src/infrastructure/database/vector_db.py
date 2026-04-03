@@ -10,7 +10,7 @@ class VectorDatabase:
 
     def __init__(self):
         self.chroma_host = "localhost"
-        self.chroma_port = 8000
+        self.chroma_port = 8001
         self.client = None
         # Enhanced collection fleet
         self.collection_names = [
@@ -22,17 +22,46 @@ class VectorDatabase:
         ]
 
     async def connect(self):
+        """
+        Robust connection with healthcheck and exponential backoff retries.
+        Task 5.1: Fail-safe vector memory bootstrapper.
+        """
         if self.client:
             return
+
+        import os
+        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+        
+        # Gektor Rule: Ensure local connections bypass proxies to avoid 502 Bad Gateway
+        os.environ["no_proxy"] = "localhost,127.0.0.1"
+        os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+
+        @retry(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry=retry_if_exception_type((Exception,)),
+            before_sleep=lambda retry_state: logger.warning(
+                f"🛡️ [VectorDB] Connection failed. Retrying in {retry_state.next_action.sleep}s... (Attempt {retry_state.attempt_number})"
+            )
+        )
+        def _connect_sync():
+            # ChromaDB v0.4+ HttpClient is synchronous by default, or we use the underlying client
+            client = chromadb.HttpClient(
+                host=self.chroma_host, 
+                port=self.chroma_port,
+                settings=chromadb.Settings(allow_reset=True, anonymized_telemetry=False)
+            )
+            # Healthcheck pulse
+            client.heartbeat()
+            return client
+
         try:
-            self.client = chromadb.HttpClient(
-                host=self.chroma_host, port=self.chroma_port
-            )
-            logger.info(
-                f"Connected to ChromaDB at {self.chroma_host}:{self.chroma_port}"
-            )
+            import asyncio
+            loop = asyncio.get_event_loop()
+            self.client = await loop.run_in_executor(None, _connect_sync)
+            logger.info(f"✅ [VectorDB] System Memory Link ESTABLISHED: {self.chroma_host}:{self.chroma_port}")
         except Exception as e:
-            logger.error(f"Failed to connect to ChromaDB: {e}")
+            logger.critical(f"💀 [VectorDB] FATAL: System Memory unreachable after retries. {e}")
             raise
 
     async def add_documents(
@@ -42,7 +71,12 @@ class VectorDatabase:
         filepaths: list[str],
         collection_name: str = "gerald-knowledge",
     ):
-        await self.connect()
+        try:
+            await self.connect()
+        except Exception as e:
+            logger.error(f"🛡️ [VectorDB] Indexing Deferred: Memory link offline. {e}")
+            return
+
         import asyncio
         loop = asyncio.get_event_loop()
         
@@ -62,7 +96,12 @@ class VectorDatabase:
         logger.info(f"Added {len(texts)} docs to Chroma collection: {collection_name}")
 
     async def search(self, query: str, limit: int = 5):
-        await self.connect()
+        try:
+            await self.connect()
+        except Exception as e:
+            logger.warning(f"🛡️ [VectorDB] Memory Search Bypassed: link offline. {e}")
+            return []
+
         all_results = []
         import asyncio
         loop = asyncio.get_event_loop()

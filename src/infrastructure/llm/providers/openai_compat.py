@@ -36,9 +36,14 @@ class OpenAICompatProvider(LLMProvider):
         for key, val in config.get("extra_headers", {}).items():
             headers[key] = val
 
+        # Setup proxy
+        import os
+        proxy_url = os.getenv("PROXY_URL")
+        
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(45.0, connect=10.0),
             headers=headers,
+            proxy=proxy_url if proxy_url else None
         )
 
     def _check_rate_limit(self):

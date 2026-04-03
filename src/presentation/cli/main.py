@@ -29,10 +29,18 @@ class GeraldCLI:
         # Start Background Indexing
         asyncio.create_task(self.indexer.scan_and_index())
 
-        # Setup signal handling for Graceful Shutdown
+        # Setup signal handling for Graceful Shutdown (Platform-Aware)
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self.shutdown)
+        if sys.platform != 'win32':
+            # POSIX systems (Linux, macOS)
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, self.shutdown)
+                except Exception as e:
+                    logger.warning(f"Failed to set signal handler for {sig}: {e}")
+        else:
+            # Windows fallback: asyncio.run() handles KeyboardInterrupt
+            logger.warning("🛡️ [OS] Windows detected. Bypassing POSIX signal handlers. Use Ctrl+C to terminate.")
 
         try:
             while not self._stop_event.is_set():
