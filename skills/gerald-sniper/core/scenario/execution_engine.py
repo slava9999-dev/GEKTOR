@@ -159,6 +159,12 @@ class ExecutionEngine:
         self.execution_mode = config.get("execution_mode", "ADVISORY").upper()
         self._processed_signal_ids: Set[str] = set()
 
+        # [Gektor v8.4] Toxicity Monitor
+        from core.shield.toxicity import ToxicityMonitor
+        from core.realtime.market_state import market_state as ms_global
+        from core.runtime.tasks import TaskRegistry
+        self.toxicity_monitor = ToxicityMonitor(TaskRegistry, self.redis, ms_global)
+
         # [Gektor v5.5] State Reconciler — Split-Brain Protection
         from core.scenario.reconciler import StateReconciler
         self.reconciler = StateReconciler(
@@ -514,6 +520,9 @@ class ExecutionEngine:
         
         from .signal_entity import SignalState
         
+        # [Gektor v8.4] Toxicity & Risk Integration
+        from core.shield.risk_engine import risk_guard
+
         if event.status == "PartiallyFilled":
             # Audit 23.2: Preserve Alpha. Fragments are tracked.
             await self.db.update_order_state_cas(
@@ -523,6 +532,9 @@ class ExecutionEngine:
                 filled_inc=event.exec_qty,
                 exch_time=int(time.time() * 1000)
             )
+            # Sync Margin Lock locally
+            risk_guard.process_fill(event.order_id, event.exec_qty)
+
             # [v7.0] If hydrated signal, ensure Smart Exit sees it
             if signal and signal.state != SignalState.POSITION_OPEN:
                 signal.filled_qty += event.exec_qty
@@ -539,6 +551,12 @@ class ExecutionEngine:
                 filled_inc=event.exec_qty,
                 exch_time=int(time.time() * 1000)
             )
+            # 1. Sync Margin Lock
+            risk_guard.process_fill(event.order_id, event.exec_qty)
+            
+            # 2. Track Toxicity (Post-Trade Markout)
+            self.toxicity_monitor.track_execution(event.symbol, event.side, event.avg_price)
+
             if signal:
                 signal.state = SignalState.POSITION_OPEN
                 signal.filled_qty = event.exec_qty
@@ -548,24 +566,21 @@ class ExecutionEngine:
                 self._recalculate_levels(signal, event.avg_price)
                 await self._send_execution_alert(signal, event.order_id)
             
-        elif event.status == "Cancelled":
+        elif event.status in ["Cancelled", "Rejected"]:
             # Audit 22.4: The Partial IOC Trap
             if event.exec_qty > 0:
                 logger.warning(f"⚠️ [Partial IOC] {event.symbol} terminal fragment: {event.exec_qty}. Preserving Alpha.")
-                await self.db.update_order_state_cas(
-                    order_id=event.order_id, 
-                    expected_state="PENDING_OPEN", 
-                    new_state="PARTIALLY_FILLED", 
-                    filled_inc=event.exec_qty,
-                    exch_time=int(time.time() * 1000)
-                )
+                risk_guard.process_fill(event.order_id, event.exec_qty)
             else:
-                await self.db.update_order_state_cas(
-                    order_id=event.order_id, 
-                    expected_state="PENDING_OPEN", 
-                    new_state="CANCELED",
-                    exch_time=int(time.time() * 1000)
-                )
+                # Full release of reserved margin
+                risk_guard.release_margin_on_reject(event.order_id)
+
+            await self.db.update_order_state_cas(
+                order_id=event.order_id, 
+                expected_state="PENDING_OPEN", 
+                new_state=event.status.upper(),
+                exch_time=int(time.time() * 1000)
+            )
 
     def _quantize_qty(self, symbol: str, qty: float) -> str:
         """Strict HFT-Rounding to Bybit qtyStep via Decimal (v2.1.9)."""
@@ -833,10 +848,10 @@ class ExecutionEngine:
              return
 
         # 4. [AMOR CLEARANCE] (Reservation)
-        is_ok, reason = await risk_guard.request_clearance(signal.symbol)
-        if not is_ok:
-            logger.warning(f"🛡️ [RiskGuard] REJECT clearance for {signal.symbol}: {reason}")
-            signal.transition_to(SignalState.REJECTED, f"RISK_GUARD:{reason}")
+        order_id = f"oms_{signal.id}"
+        if not risk_guard.reserve_margin(order_id, signal.symbol, raw_qty, entry):
+            logger.warning(f"🛡️ [RiskGuard] REJECT clearance for {signal.symbol}: Insufficient Margin or Load Limit.")
+            signal.transition_to(SignalState.REJECTED, "RISK_GUARD:REJECT")
             return False
 
         # 5. [EXECUTION DELEGATION] (Limit FOK v5.9)
@@ -896,11 +911,12 @@ class ExecutionEngine:
             exec_qty = float(resp.get("filled_qty", 0.0))
             order_id = resp.get("order_id") or f"oms_{signal.id}"
             
-            # Atomic Exposure Adjustment (v5.9: Fully releases if Kill happens)
-            await risk_guard.adjust_exposure(signal.symbol, exec_qty, entry)
-            
+            # success_id is only available if Fill happened instantly (FOK result)
             if exec_qty == 0:
                 logger.warning(f"🚫 [OMS] FOK Kill for {signal.symbol}. Zero Entry.")
+                # Atomic Exposure Release
+                risk_guard.release_margin_on_reject(f"oms_{signal.id}")
+                
                 signal.transition_to(SignalState.REJECTED, "FOK_KILL")
                 await self.db.update_order_state_cas(f"oms_{signal.id}", "PENDING_OPEN", "CANCELED")
                 return False
