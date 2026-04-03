@@ -192,5 +192,94 @@ class NerveCenter:
             logger.error(f"❌ [NerveCenter] Dispatch Error on {channel} (msg_id: {msg_id}): {e}")
             # If processing fails, do NOT ACK the message. It will remain in pending and can be retried.
 
-# Global instance
+class CircuitState(Enum):
+    CLOSED = "CLOSED"       
+    OPEN = "OPEN"           
+    HALF_OPEN = "HALF_OPEN" 
+
+class TelegramCircuitBreaker:
+    """Паттерн Circuit Breaker для изоляции отказов Telegram API."""
+    def __init__(self, threshold: int = 5, recovery_sec: float = 60.0):
+        self.threshold = threshold
+        self.recovery_sec = recovery_sec
+        self.state = CircuitState.CLOSED
+        self.failures = 0
+        self.last_fail_time = 0.0
+
+    def can_fire(self) -> bool:
+        if self.state == CircuitState.CLOSED:
+            return True
+        if self.state == CircuitState.OPEN:
+            if time.time() - self.last_fail_time > self.recovery_sec:
+                self.state = CircuitState.HALF_OPEN
+                logger.warning("🔄 [CIRCUIT BREAKER] Переход в HALF_OPEN. Разрешаем 1 зондирующий запрос.")
+                return True
+            return False
+        # [АВАНГАРДНОЕ ИСПРАВЛЕНИЕ]
+        # Если мы уже в HALF_OPEN, это значит зонд уже улетел и мы ждем его ответа.
+        # Все остальные таски в этот момент ОБЯЗАНЫ отбрасываться.
+        return False
+
+    def record_success(self):
+        if self.state != CircuitState.CLOSED:
+            logger.info("✅ [CIRCUIT BREAKER] Коннект восстановлен. Переход в CLOSED.")
+        self.state = CircuitState.CLOSED
+        self.failures = 0
+
+    def record_failure(self):
+        self.failures += 1
+        self.last_fail_time = time.time()
+        if self.state == CircuitState.HALF_OPEN or self.failures >= self.threshold:
+            if self.state != CircuitState.OPEN:
+                logger.critical(f"🛑 [CIRCUIT BREAKER] TG API МЕРТВ. Переход в OPEN на {self.recovery_sec}с.")
+            self.state = CircuitState.OPEN
+
+
+class TelegramNerveCenter:
+    def __init__(self, bot_token: str, chat_id: str, redis_client: aioredis.Redis):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.redis = redis_client
+        self.LOCK_TTL_SEC = 900
+        self.breaker = TelegramCircuitBreaker(threshold=3, recovery_sec=60)
+        self.concurrency_guard = asyncio.Semaphore(5)
+
+    async def dispatch_anomaly_alert(self, symbol: str, anomaly_type: str, metric_value: float) -> bool:
+        if not self.breaker.can_fire():
+            logger.debug(f"🛑 [FAIL-FAST] {symbol} сброшен. Telegram Circuit Breaker = OPEN.")
+            return False
+
+        if self.concurrency_guard.locked():
+            logger.error(f"⚠️ [BACKPRESSURE] Event Loop Pool (5/5) заполнен. Сигнал отброшен.")
+            return False
+
+        lock_key = f"ALERT_LOCK:{symbol}:{anomaly_type}"
+        acquired = await self.redis.set(lock_key, "LOCKED", ex=self.LOCK_TTL_SEC, nx=True)
+        if not acquired:
+            return False
+
+        async with self.concurrency_guard:
+            try:
+                # Mock aiohttp request
+                # await asyncio.wait_for(session.post(...), timeout=1.5)
+                await asyncio.sleep(0.1) 
+                logger.info(f"🚨 [NERVE_CENTER] СИГНАЛ: {symbol} | {anomaly_type} | {metric_value:.2f}%")
+                
+                self.breaker.record_success()
+                return True
+                
+            except asyncio.TimeoutError:
+                logger.error("🌐 [TELEGRAM TIMEOUT] Пакет утерян.")
+                self.breaker.record_failure()
+                await self.redis.expire(lock_key, 30)
+                return False
+                
+            except Exception as e:
+                logger.critical(f"FATAL: Сбой Nerve Center: {e}")
+                self.breaker.record_failure()
+                await self.redis.expire(lock_key, 30)
+                return False
+
+# Global instances
 bus = NerveCenter()
+
