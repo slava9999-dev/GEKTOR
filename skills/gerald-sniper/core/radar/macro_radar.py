@@ -43,8 +43,8 @@ def _generate_signal_id(symbol: str, direction: str) -> str:
 
 class MacroSignal(BaseModel):
     """
-    [GEKTOR v11.1] Macro Anomaly Signal.
-    Focus on Volume-Flow alignment (CVD).
+    [GEKTOR v11.9] Macro Anomaly Signal.
+    Focus on Volume-Flow alignment + Predictive Projections.
     """
     symbol: str
     direction: int        # 1 for LONG, -1 for SHORT
@@ -54,6 +54,20 @@ class MacroSignal(BaseModel):
     cvd_alignment: bool   # Does the impulse align with global CVD?
     price: float = 0.0
     timestamp: float = Field(default_factory=time.time)
+    
+    # [GEKTOR v11.7] Analysis Fields
+    signal_type: Optional[str] = None # ICEBERG_BUY, EXHAUSTION, etc.
+    regime: str = "NORMAL"            # EXPANSION, COMPRESSION
+    vr: float = 1.0                   # Volatility Ratio
+    atr: float = 0.0
+    targets: Dict[str, float] = Field(default_factory=dict) # {"sl": 10.5, "tp": 12.0}
+    liquidity_tier: str = "C"
+    tick_size: float = 0.001
+
+    # [GEKTOR v11.7] Multi-Vector Historical primitives (for IPC)
+    hist_p: List[float] = Field(default_factory=list)
+    hist_c: List[float] = Field(default_factory=list)
+    hist_v: List[float] = Field(default_factory=list)
 
     @property
     def direction_str(self) -> str:
@@ -146,45 +160,48 @@ from core.events.events import AlertEvent
 from core.events.nerve_center import bus
 from collections import deque
 
-# [GEKTOR v11.6] Top-level functions for ProcessPool pickling
-def _cpu_bound_heavy_analysis(p: np.ndarray, c: np.ndarray, v: np.ndarray, lookback: int) -> dict:
+# [GEKTOR v11.7] Top-level functions for OPTIMIZED IPC (No Pydantic/Objects)
+def _cpu_bound_heavy_analysis(p: List[float], c: List[float], v: List[float], 
+                               tick: float, lookback: int) -> dict:
     """
-    [GEKTOR v11.6] Multi-vector Microstructural Analysis (Isolate CPU).
-    Performs Polyfit, GARCH Variance Ratio, and Robust Normalization in 0-GIL process.
+    [GEKTOR v11.7] Raw-Primitive IPC Math (Zero-Object Serialization).
+    Uses Dynamic Noise Floor based on Tick Size to defeat the Relativity Trap.
     """
     res = {"div": None, "regime": "NORMAL", "vr": 1.0}
     if len(p) < lookback: return res
     
-    # 1. VOLATILITY CLUSTERING (Fractal Anchor)
-    rets = np.diff(p) / (p[:-1] + 1e-12)
+    p_arr = np.array(p, dtype=np.float32)
+    c_arr = np.array(c, dtype=np.float32)
+    v_arr = np.array(v, dtype=np.float32)
+    
+    # 1. DYNAMIC NOISE ANCHOR (v11.7)
+    # Anchor = (Min Step / Current Price)^2. Absolute floor for variance.
+    curr_p = p_arr[-1]
+    noise_floor = (tick / curr_p) ** 2
+    
+    # 2. VOLATILITY CLUSTERING (Fractal Anchor)
+    rets = np.diff(p_arr) / (p_arr[:-1] + 1e-12)
     s_win, l_win = 20, 100
     if len(rets) >= l_win:
-        s_var = np.var(rets[-s_win:])
-        l_var = np.var(rets[-l_win:])
-        
-        # [GEKTOR v11.6] THE NOISE FLOOR ANCHOR
-        # Prevents 'Relativity Trap' in dead markets. 
-        # A 0.05% price move should be the minimum financial significance.
-        noise_floor = 1e-6 # (0.1% volatility squared baseline)
-        vr = (s_var + noise_floor) / (l_var + noise_floor)
+        s_var = np.var(rets[-s_win:]) + noise_floor
+        l_var = np.var(rets[-l_win:]) + noise_floor
+        vr = (s_var) / (l_var)
         res["vr"] = float(vr)
-        
         if vr > 2.0: res["regime"] = "EXPANSION"
         elif vr < 0.5: res["regime"] = "COMPRESSION"
 
-    # 2. ROBUST DIVERGENCE (Iceberg/Exhaustion)
-    # Norm using 5/95 quantiles for outlier-resistant min-max
-    p_min, p_max = np.percentile(p, [5, 95])
-    c_min, c_max = np.percentile(c, [5, 95])
-    norm_p = (p - p_min) / (p_max - p_min + 1e-9)
-    norm_c = (c - c_min) / (c_max - c_min + 1e-9)
+    # 3. ROBUST DIVERGENCE (Iceberg/Exhaustion)
+    p_min, p_max = np.percentile(p_arr, [5, 95])
+    c_min, c_max = np.percentile(c_arr, [5, 95])
+    norm_p = (p_arr - p_min) / (p_max - p_min + 1e-9)
+    norm_c = (c_arr - c_min) / (c_max - c_min + 1e-9)
     
-    x = np.arange(len(p))
+    x = np.arange(len(p_arr))
     p_slope = np.polyfit(x, norm_p, 1)[0]
     c_slope = np.polyfit(x, norm_c, 1)[0]
     
     s_diff = c_slope - p_slope
-    mean_v = np.mean(v[-5:])
+    mean_v = np.mean(v_arr[-5:])
     
     if s_diff > 0.08 and p_slope <= 0.02:
         res["div"] = "ICEBERG_SELL" if mean_v > 2.5 else "EXHAUSTION_SHORT"
@@ -193,16 +210,30 @@ def _cpu_bound_heavy_analysis(p: np.ndarray, c: np.ndarray, v: np.ndarray, lookb
         
     return res
 
+class AdvisoryTargetCalculator:
+    """[GEKTOR v11.7] Predictive SL/TP Generator for Radar Projections."""
+    @staticmethod
+    def calculate(price: float, atr: float, regime: str, direction: int) -> dict:
+        mult = 2.0 if regime == "EXPANSION" else 1.2
+        stop = atr * mult
+        take = atr * (mult * 1.5)
+        if direction == 1:
+            return {"sl": price - stop, "tp": price + take}
+        return {"sl": price + stop, "tp": price - take}
+
 class MathOrchestrator:
-    """[GEKTOR v11.6] IPC Math Controller. 0% Event Loop Blocking."""
+    """[GEKTOR v11.7] IPC Math Controller. Passes only primitives."""
     def __init__(self, max_workers: int = 4):
         self._pool = ProcessPoolExecutor(max_workers=max_workers)
         
-    async def analyze_multivector(self, symbol: str, prices: np.ndarray, cvds: np.ndarray, rvols: np.ndarray, lookback: int):
+    async def analyze_multivector(self, symbol: str, prices: List[float], 
+                                  cvds: List[float], rvols: List[float], 
+                                  tick: float, lookback: int):
         loop = asyncio.get_event_loop()
         try:
+            # GEKTOR v11.7: Deep-pickling prevention (Lists of primitives only)
             return await loop.run_in_executor(
-                self._pool, _cpu_bound_heavy_analysis, prices, cvds, rvols, lookback
+                self._pool, _cpu_bound_heavy_analysis, prices, cvds, rvols, tick, lookback
             )
         except Exception as e:
             logger.error(f"❌ [MathOrchestrator] IPC Error for {symbol}: {e}")
@@ -301,8 +332,9 @@ class MacroRadar:
         self.guard = AtomicDirectionalGuard(bus.redis, lock_ttl_sec=config.get("lock_ttl_sec", 14400))
         self.cvd = CVDAggregator()
         self.orchestrator = MathOrchestrator(max_workers=config.get("math_processes", 4))
+        self.advisory = AdvisoryTargetCalculator()
         
-        # [GEKTOR v11.5] Dynamic Risk & Robust Statistics
+        # [GEKTOR v11.7] Dynamic Risk & Robust Statistics
         self.robust_math = RobustMath()
         self.universe_size = config.get("universe_size", 50)
         self.shock_detector = RollingSystemicShockDetector(universe_size=self.universe_size)
@@ -311,7 +343,12 @@ class MacroRadar:
         # Simplified thresholds
         self.min_turnover_24h = config.get("min_turnover_24h_usd", 10_000_000)
         self.min_z_score = config.get("min_z_score", 3.0)
+        self.base_z_score = self.min_z_score
         self.min_imbalance = config.get("min_imbalance", 2.5)
+
+        # [GEKTOR v11.9] Adaptive Sensitivity Engine
+        self._last_alert_time = time.time()
+        self._sensitivity_timer = time.time()
 
         # Stats
         self.stats = {"scans": 0, "anomalies": 0, "alerts": 0}
@@ -481,6 +518,16 @@ class MacroRadar:
             return []
         
         t_fetch = time.monotonic() - t0
+        
+        # ── [GEKTOR v11.9] Self-Correcting Threshold ──────────────────
+        # Calibration: Every 15 minutes of silence, lower Z-Score by 0.1
+        # Upon any alert, reset to base value.
+        now = time.time()
+        silence_duration = now - self._last_alert_time
+        if silence_duration > 1800 and (now - self._sensitivity_timer) > 900:
+            self.min_z_score = max(1.5, self.min_z_score - 0.2)
+            self._sensitivity_timer = now
+            logger.info(f"⚡ [MacroRadar] Sensitivity Boost: Z-Score dropped to {self.min_z_score:.1f}σ (Silence: {silence_duration/60:.0f}m)")
         
         # Record ALL tickers into OI store (building history for Delta calc)
         candidates = []
@@ -656,20 +703,37 @@ class MacroRadar:
                 return None  # Move too small to be actionable
             
             # ══ SIGNAL CONFIRMED ═════════════════════════════════════════
-            direction = "LONG_IMPULSE" if price_delta_pct > 0 else "SHORT_IMPULSE"
-            sig_id = _generate_signal_id(symbol, direction)
+            direction_val = 1 if price_delta_pct > 0 else -1
+            direction_name = "LONG_IMPULSE" if direction_val == 1 else "SHORT_IMPULSE"
+            sig_id = _generate_signal_id(symbol, direction_name)
             
+            # [GEKTOR v11.7] Populate Vectors for IPC Math
+            # hist_p: closes, hist_c: cvd (approximated from volume/side), hist_v: rvols
+            hist_p = [float(k[4]) for k in klines]
+            hist_v = [float(k[6]) for k in klines]
+            
+            # Approximated CVD history for the scan
+            hist_c = []
+            curr_c = 0.0
+            for k in klines:
+                k_open, k_close = float(k[1]), float(k[4])
+                k_side = 1 if k_close >= k_open else -1
+                curr_c += (float(k[6]) * k_side)
+                hist_c.append(curr_c)
+
             signal = MacroSignal(
                 symbol=symbol,
-                direction=direction,
+                direction=direction_val,
                 rvol=round(rvol, 2),
-                oi_delta_pct=round(candidate["oi_delta_pct"], 2),
-                price_delta_pct=round(price_delta_pct, 2),
-                turnover_usdt=candle_turnover,
-                funding_rate=candidate["funding_rate"],
-                liquidity_tier=candidate["tier"],
+                z_score=self.robust_math.get_z_score_robust(price_delta_pct, np.array([((float(k[4])-float(k[1]))/float(k[1])*100) for k in klines[:-1]])),
+                imbalance=self.min_imbalance, # Placeholder for micro-imbalance
+                cvd_alignment=self.cvd.get_alignment(symbol, direction_val),
                 price=close_p,
-                signal_id=sig_id,
+                hist_p=hist_p,
+                hist_c=hist_c,
+                hist_v=hist_v,
+                liquidity_tier=candidate["tier"],
+                atr=np.mean([abs(float(k[2])-float(k[3])) for k in klines[-5:]]) # Simple ATR
             )
             
             self.stats["anomalies_found"] += 1
@@ -702,16 +766,23 @@ class MacroRadar:
             # (Math implemented in scanner to filter candidates before dispatch)
             
             # 2. Heavy Multi-Vector Analysis (Exhaustion, Iceberg, Regime)
-            # Offloaded to ProcessPool via IPC
+            # GEKTOR v11.7: Extract raw lists to minimize IPC/Pickling lac
+            raw_p = [float(x) for x in sig.hist_p]
+            raw_c = [float(x) for x in sig.hist_c]
+            raw_v = [float(x) for x in sig.hist_v]
+            
             analysis = await self.orchestrator.analyze_multivector(
-                sig.symbol, sig.hist_p, sig.hist_c, sig.hist_v, 15
+                sig.symbol, raw_p, raw_c, raw_v, sig.tick_size, 15
             )
             
             sig.signal_type = analysis.get("div")
             sig.regime = analysis.get("regime")
             sig.vr = analysis.get("vr")
             
-            # 3. Global Resilience
+            # 3. Advisory Range Calculation
+            sig.targets = self.advisory.calculate(sig.price, sig.atr, sig.regime, sig.direction)
+            
+            # 4. Global Resilience
             is_shock = await self.shock_detector.check(sig)
             if is_shock:
                 await self._handle_systemic_shock(sig.direction, active_signals + [sig])
@@ -724,25 +795,42 @@ class MacroRadar:
             if status in ("ALLOWED_NEW", "ALLOWED_OVERRIDE"):
                 active_signals.append(sig)
                 self._send_individual_alert(sig, status)
+                # RESET ADAPTIVE SENSITIVITY
+                self._last_alert_time = time.time()
+                self.min_z_score = self.base_z_score
 
     def _send_individual_alert(self, sig: MacroSignal, status: str):
-        emoji = "🟢" if sig.direction == 1 else "🔴"
+        """[GEKTOR v11.9] Advanced Alert Formatter — Institutional Report."""
+        emoji = "🚀" if sig.direction == 1 else "☄️"
         prefix = "STRUCTURAL BREAK" if status == "ALLOWED_OVERRIDE" else "MACRO ANOMALY"
-        title = f"{emoji} {prefix}: {sig.symbol}"
+        
+        # 1. Advisory Projections
+        sl = sig.targets.get("sl", 0.0)
+        tp = sig.targets.get("tp", 0.0)
+        rr = abs(tp - sig.price) / abs(sig.price - sl) if abs(sig.price - sl) > 0 else 0
+        
+        # 2. Institutional Metadata
+        div_str = sig.signal_type.replace("_", " ") if sig.signal_type else "MOMENTUM"
+        tier_emoji = {"A": "💎", "B": "🥇", "C": "🥈", "D": "🥉"}.get(sig.liquidity_tier, "⚪")
         
         message = (
-            f"🚨 <b>{prefix}</b> 🚨\n"
+            f"🚨 <b>{prefix}</b> {emoji}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>{sig.symbol}</b> | {sig.direction_str}\n"
-            f"💰 Цена: <code>${sig.price}</code>\n"
-            f"📈 Z-Score: <b>{sig.z_score:+.2f}σ</b>\n"
-            f"⚖️ Дисбаланс: <b>{sig.imbalance:.2f}x</b>\n"
-            f"🌊 CVD Alignment: <b>{'✅ MATCH' if sig.cvd_alignment else '❌ NO'}</b>\n"
+            f"💰 Price: <code>${sig.price:,.4f}</code>\n"
+            f"🧬 Signal: <b>{div_str}</b>\n"
+            f"📈 Z-Score: <b>{sig.z_score:+.2f}σ</b> | RVOL: <b>{sig.rvol:.1f}x</b>\n"
+            f"⚖️ CVD: <b>{'✅ MATCH' if sig.cvd_alignment else '❌ NO'}</b> | Tier: {tier_emoji} <b>{sig.liquidity_tier}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🔐 <i>Guard: {status} | TTL: {self.guard.ttl // 3600}h</i>"
+            f"🎯 <b>ADVISORY PROJECTION</b>\n"
+            f"🟢 Take Profit: <code>${tp:,.4f}</code>\n"
+            f"🔴 Stop Loss:   <code>${sl:,.4f}</code>\n"
+            f"⚖️ Risk/Reward: <b>{rr:.2f}</b> | Regime: <b>{sig.regime}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🔐 <i>Guard: {status} | Noise Floor: Dynamic</i>"
         )
         
-        bus.publish(AlertEvent(title=title, message=message))
+        bus.publish(AlertEvent(title=f"{emoji} {prefix}: {sig.symbol}", message=message))
         self.stats["alerts"] += 1
 
     async def _handle_systemic_shock(self, direction: int, signals: List[MacroSignal]):

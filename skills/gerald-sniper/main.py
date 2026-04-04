@@ -63,6 +63,7 @@ from data.swarm.sentiment_worker import NeuralSentinel as AnalysisWorker
 from core.alerts.bot_listener import start_bot_listener
 from core.alerts.outbox import telegram_outbox
 from core.radar.macro_radar import MacroRadar
+from core.radar.universe import DynamicUniverseShaker
 from core.shield.amputation import get_amputation_protocol
 from pre_flight import PreflightCommander, PeriodicKeyValidator
 from core.events.nerve_center import NerveCenter
@@ -146,6 +147,8 @@ async def main():
         res_monitor = ResourceMonitor(stop_event, ws_manager, candle_mgr)
         from core.health.heartbeat_emitter import heartbeat_emitter
         
+        shaker = None
+        shaker_task = None
         macro_radar = None
         macro_radar_task = None
         # Load macro_radar if enabled
@@ -155,6 +158,16 @@ async def main():
             with open(cfg_path, 'r', encoding='utf-8') as f:
                 full_cfg = yaml.safe_load(f)
             macro_cfg = full_cfg.get("macro_radar", {})
+            
+            # [GEKTOR v11.9] Universe Shaker Integration
+            shaker = DynamicUniverseShaker(
+                rest=rest_client,
+                redis=bus.redis,
+                min_turnover_usd=macro_cfg.get("universe_turnover_floor", 50_000_000),
+                max_spread_bps=macro_cfg.get("universe_spread_cap_bps", 15.0)
+            )
+            shaker_task = safe_task(shaker.start(), name="universe_shaker")
+            
             if macro_cfg.get("enabled", True):
                 macro_radar = MacroRadar(
                     rest=rest_client,
@@ -163,7 +176,8 @@ async def main():
                     dispatcher=signal_dispatcher
                 )
                 macro_radar_task = safe_task(macro_radar.start(), name="macro_radar")
-        except: pass
+        except Exception as e:
+            logger.error(f"❌ [Main] Shaker/Radar initialization failed: {e}")
 
         tasks = [
             safe_task(res_monitor.run(), name="res_monitor"),
@@ -184,6 +198,10 @@ async def main():
         if macro_radar_task:
             watchdog.register("macro_radar", macro_radar_task, restart_factory=lambda: safe_task(macro_radar.start(), name="macro_radar"))
             tasks.append(macro_radar_task)
+            
+        if shaker_task:
+            watchdog.register("universe_shaker", shaker_task, restart_factory=lambda: safe_task(shaker.start(), name="universe_shaker"))
+            tasks.append(shaker_task)
 
         watchdog_task = safe_task(watchdog.run(), name="vitals_watchdog")
         tasks.append(watchdog_task)

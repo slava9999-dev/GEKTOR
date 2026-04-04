@@ -146,6 +146,13 @@ class SymbolLiveState:
     current_cvd: float = 0.0 # Asset units (sum of qty * side)
     last_cvd_checkpoint: float = 0.0
     
+    # [GEKTOR v11.7-11.9] State Integrity & Lifecycle
+    is_reconciling: bool = False
+    is_removing: bool = False # [GEKTOR v11.9] Tombstone Flag
+    tombstone_expiration: float = 0.0
+    parking_buffer: deque = field(default_factory=lambda: deque(maxlen=2000))
+    last_seq_id: int = 0
+    
     # [GEKTOR v11.3] Tox-Vol Tracking (Metadata, not raw counter)
     toxic_volume_total: float = 0.0 
     pending_liq_events: deque = field(default_factory=lambda: deque(maxlen=50))
@@ -191,6 +198,8 @@ class SymbolLiveState:
         self.last_cvd_checkpoint = 0.0
         self.toxic_volume_total = 0.0
         self.pending_liq_events.clear()
+        self.is_reconciling = False
+        self.parking_buffer.clear()
 
     def tag_toxic_volume(self, liq_qty: float, side: str):
         """

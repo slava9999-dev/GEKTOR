@@ -157,3 +157,13 @@ class SystemBlindnessEvent(BaseEvent):
     reason: str         # "Stale-Skew", "Zero-Derivative", "OS-Socket-Freeze"
     stale_ms: int       # Age of last valid message
     is_active: bool = True
+
+class UniverseChangeEvent(BaseEvent):
+    """
+    [GEKTOR v11.9] Universe Rebalancing Event.
+    Fired when the set of active symbols changes due to liquidity/volatility shifts.
+    """
+    new_universe: List[str]
+    added: List[str]
+    removed: List[str]
+    reason: str = "SCHEDULED_REBALANCE"
