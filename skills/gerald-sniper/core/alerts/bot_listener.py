@@ -11,7 +11,8 @@ from loguru import logger
 
 from utils.config import config
 from core.events.nerve_center import bus
-from core.events.events import ManualExecutionEvent
+from core.events.events import ManualExecutionEvent, SignalLifecycleEvent
+from core.radar.lifecycle import lifecycle_manager, RadarSignalState
 
 # Bot instance will be initialized lazily to prevent TokenValidationError during startup
 bot = None
@@ -24,42 +25,53 @@ _db = None
 _stop_event = None
 _macro_radar = None  # [GEKTOR v8.1] Reference to MacroRadar for signal cache
 
-def build_tactical_keyboard(signal_id: str, symbol: str, price: float) -> InlineKeyboardMarkup:
-    """Generates inline buttons for trade execution/rejection."""
-    builder = InlineKeyboardBuilder()
-    # Формат callback_data: action|symbol|price|signal_id
-    # Длина callback_data в Telegram ограничена 64 байтами
-    cb_data = f"exec|{symbol}|{price:.6f}|{signal_id}"
-    
-    builder.button(text="⚡ ВХОД (Limit IOC)", callback_data=cb_data)
-    builder.button(text="🚫 ПАС", callback_data=f"pass|{signal_id}")
-    return builder.as_markup()
+def build_tactical_keyboard(signal_id: str) -> None:
+    """[GEKTOR v11.0] Amputated: Pure Text Mode."""
+    return None
+
+# [GEKTOR v11.0] Interactive Callbacks Disabled
+# ... (handlers removed for purity) ...
 
 @tactical_router.callback_query(F.data.startswith("exec|"))
 async def handle_execute_button(callback: CallbackQuery):
-    """Handles [⚡ ВХОД] button click."""
+    """[GEKTOR v10.2] Handles [⚡ ВХОД] with Redis-state & Pessimistic Audit."""
     try:
-        # data format: exec|SYMBOL|PRICE|SIGNAL_ID
-        _, symbol, price_str, signal_id = callback.data.split("|")
+        # data format: exec|SIGNAL_UUID
+        parts = callback.data.split("|")
+        if len(parts) < 2:
+            await callback.answer("⚠️ Ошибка формата данных.", show_alert=True)
+            return
+            
+        uuid = parts[1]
         
-        logger.info(f"🕹️ [Operator] Команда на ВХОД: {symbol} по {price_str} (ID: {signal_id})")
+        # 1. Fetch persistent state from Redis
+        state = await lifecycle_manager.get_signal_state(uuid)
+        if not state:
+            await callback.answer("⌛ [EXPIRED] СИГНАЛ УНИЧТОЖЕН\n(Время жизни в Redis истекло)", show_alert=True)
+            await callback.message.edit_text(f"{callback.message.html_text}\n\n<i>[⚠️ ОТКЛОНЕНО: СИГНАЛ ПРОТУХ]</i>", reply_markup=None, parse_mode="HTML")
+            return
+            
+        # 2. ⚖️ PESSIMISTIC AUDITOR: Reality Sync
+        # Look back at market history between creation and current tap.
+        audited_price = await lifecycle_manager.get_audited_entry_price(state, time.time())
         
-        # 1. Отвечаем Telegram, чтобы убрать часики загрузки
-        await callback.answer("⏳ Сигнал передан в OMS...", show_alert=False)
+        logger.info(f"🕹️ [Operator] Executing {state.symbol} (ID: {uuid}) | Audited Price: {audited_price}")
         
-        # 2. Модифицируем сообщение (убираем кнопку, чтобы не нажать дважды)
+        await callback.answer("⏳ Цена синхронизирована (Pessimistic Auditor).", show_alert=False)
         await callback.message.edit_text(
-            f"{callback.message.html_text}\n\n<i>[⚡ ЗАПРОС НА ИСПОЛНЕНИЕ ОТПРАВЛЕН]</i>",
+            f"{callback.message.html_text}\n\n<i>[⚡ ЗАПРОС ПРИНЯТ: Entry @ {audited_price}]</i>",
             reply_markup=None,
             parse_mode="HTML"
         )
         
-        # 3. Публикуем эвент в NerveCenter (ExecutionEngine его поймает)
         event = ManualExecutionEvent(
-            signal_id=signal_id,
+            signal_id=state.id,
             action="EXECUTE",
             user_id=str(callback.from_user.id),
-            timestamp=time.time()
+            timestamp=time.time(),
+            symbol=state.symbol,
+            price=audited_price,
+            direction=state.direction
         )
         await bus.publish(event)
         
@@ -102,21 +114,28 @@ async def handle_pass_button(callback: CallbackQuery):
 
 @tactical_router.callback_query(F.data.startswith("mexec|"))
 async def handle_macro_execute(callback: CallbackQuery):
-    """[GEKTOR v8.1] One-Click Entry from MacroRadar alert."""
+    """[GEKTOR v10.2] One-Click Entry with Institutional State & Reaper protection."""
     try:
-        # Parse callback: mexec|WIFUSDT|2.5000|L|a1b2c3d4
         parts = callback.data.split("|")
-        if len(parts) != 5:
+        if len(parts) != 2:
             await callback.answer("❌ Неверный формат данных.", show_alert=True)
             return
         
-        _, symbol, price_str, direction_short, signal_id = parts
-        price = float(price_str)
-        direction = "LONG" if direction_short == "L" else "SHORT"
+        uuid = parts[1]
+        
+        # 1. State Retrieval
+        state = await lifecycle_manager.get_signal_state(uuid)
+        if not state:
+            await callback.answer("⌛ [STALE] Аномалия отыграна или исчезла.", show_alert=True)
+            await callback.message.edit_text(f"{callback.message.html_text}\n\n<i>[⚠️ ОТКЛОНЕНО: СИГНАЛ УСТАРЕЛ]</i>", reply_markup=None, parse_mode="HTML")
+            return
+            
+        # 2. ⚖️ Reality Sync: Pessimistic Audit
+        audited_price = await lifecycle_manager.get_audited_entry_price(state, time.time())
         
         logger.info(
-            f"🕹️ [Operator] MACRO ENTRY: {direction} {symbol} @ {price} "
-            f"(Signal: {signal_id})"
+            f"🕹️ [Operator] MACRO ENTRY: {state.direction} {state.symbol} @ {audited_price} "
+            f"(ID: {uuid}) | Auditor PenaltyApplied"
         )
         
         # ══════════════════════════════════════════════════════════════════
@@ -200,13 +219,13 @@ async def handle_macro_execute(callback: CallbackQuery):
         
         # 3. Publish execution event to NerveCenter (guaranteed unique)
         event = ManualExecutionEvent(
-            signal_id=signal_id,
+            signal_id=state.id,
             action="EXECUTE",
             user_id=str(callback.from_user.id),
             timestamp=time.time(),
-            symbol=symbol,
-            price=price,
-            direction=direction,
+            symbol=state.symbol,
+            price=audited_price,
+            direction=state.direction,
             source="MACRO_RADAR",
         )
         await bus.publish(event)
@@ -518,6 +537,16 @@ async def handle_cooldown_status(message: types.Message):
 # Include the router in the main dispatcher
 dp.include_router(tactical_router)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# [GEKTOR v10.2] LIFECYCLE EVENT HANDLER
+# Links outbox messages to signal states for proactive Reaper invalidation.
+# ─────────────────────────────────────────────────────────────────────────────
+async def handle_lifecycle_event(event: SignalLifecycleEvent):
+    """Handles external SignalLifecycleEvents from Outbox."""
+    if event.action == "SENT" and event.message_id:
+        logger.debug(f"🔗 [Bot] Linking UI for signal {event.signal_id} -> msg {event.message_id}")
+        await lifecycle_manager.link_message(event.signal_id, event.chat_id, event.message_id)
+
 async def start_bot_listener(paper_tracker=None, db=None, stop_event=None, macro_radar=None):
     """Entry point to run the listener task with Resilience (Audit 16)."""
     global _paper_tracker, _db, _stop_event, _macro_radar
@@ -552,7 +581,13 @@ async def start_bot_listener(paper_tracker=None, db=None, stop_event=None, macro
             logger.error("❌ [Bot] Invalid Telegram Token! Interaction disabled.")
             return
         
-        logger.info("📡 [Bot] Tactical Listener ACTIVE (AIOGRAM v3)")
+        # Subscribe to Lifecycle events for UI Linkage
+        bus.subscribe(SignalLifecycleEvent, handle_lifecycle_event)
+
+        # 💀 START THE REAPER (GEKTOR v10.2)
+        await lifecycle_manager.start_reaper(local_bot)
+
+        logger.info("📡 [Bot] Tactical Listener ACTIVE (GEKTOR v10.2)")
         await dp.start_polling(local_bot, skip_updates=True)
         
     except Exception as e:

@@ -23,7 +23,7 @@ class TacticalOrchestrator:
     def __init__(self):
         self.db = None
         self.active_signals: Dict[str, TradingSignal] = {}
-        self.signal_queue = asyncio.Queue()
+        self.signal_queue = asyncio.Queue(maxsize=1000)
         self._started = False
         self.paper_tracker = None
         self._btc_context = "FLAT"
@@ -41,7 +41,7 @@ class TacticalOrchestrator:
         if isinstance(btc_ctx, dict):
             self._btc_context = btc_ctx.get("trend", "FLAT")
 
-    async def start(self, db_manager, paper_tracker, candle_cache, adapter=None, level_service=None, loop=None, time_sync=None):
+    async def start(self, db_manager, paper_tracker, candle_cache, adapter=None, level_service=None, loop=None, time_sync=None, kill_switch=None):
         if self._started: return
         self.db = db_manager
         self.paper_tracker = paper_tracker
@@ -56,7 +56,7 @@ class TacticalOrchestrator:
         
         config_dict = config.dict() if hasattr(config, 'dict') else config
         # Task 3.3: Inject Adapter via DI
-        self.execution_engine = ExecutionEngine(db_manager, adapter, bus.redis, candle_cache, config_dict, time_sync=time_sync)
+        self.execution_engine = ExecutionEngine(db_manager, adapter, bus.redis, candle_cache, config_dict, time_sync=time_sync, kill_switch=kill_switch)
         self.decision_engine = DecisionEngine(config_dict)
         from core.shield.risk_engine import risk_guard
         self.risk_guard = risk_guard
@@ -561,7 +561,7 @@ class TacticalOrchestrator:
                 mem_manager.trigger_hft_gc(1)
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
-            await asyncio.sleep(600)
+            await asyncio.sleep(60)
 
 # Global instance
 tactical_orchestrator = TacticalOrchestrator()

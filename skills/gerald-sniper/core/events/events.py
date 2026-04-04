@@ -20,9 +20,13 @@ class PriceUpdateEvent(BaseEvent):
     """Event fired when new prices arrive (Rule 2.3)"""
     prices: Dict[str, float] = Field(default_factory=dict)
 
+from utils.math_utils import generate_sortable_id
+
 class SignalEvent(BaseEvent):
-    """Event fired when a new signal is processed by Tactical Orchestrator"""
-    signal_id: str = "" # UUID for tracking across TG buttons
+    """
+    [GEKTOR v10.3] Advisory Signal Event with Time-Sorted IDs.
+    """
+    signal_id: str = Field(default_factory=generate_sortable_id)
     symbol: str = ""
     direction: str = "" # LONG, SHORT
     confidence: float = 0.0
@@ -30,7 +34,19 @@ class SignalEvent(BaseEvent):
     factors: List[str] = Field(default_factory=list)
     market_regime: str = "FLAT"
     liquidity_tier: str = "C"
+    created_at: float = Field(default_factory=time.time)
+    max_age_sec: int = 40
+    rvol: float = 1.0 # Added for dynamic TTL
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class SignalLifecycleEvent(BaseEvent):
+    """
+    [GEKTOR v10.2] Event for synchronizing Signal State with UI (Telegram).
+    """
+    signal_id: str
+    action: str # SENT, EXPIRED, CANCELLED
+    chat_id: Optional[int] = None
+    message_id: Optional[int] = None
 
 class ManualExecutionEvent(BaseEvent):
     """Event fired from Telegram UI for human-in-the-loop actions"""
@@ -89,6 +105,7 @@ class RawWSEvent(BaseEvent):
     u: Optional[int] = None
     seq: int = 0 # Bybit V5 Cross-Sequence
     type: str = "delta" # Bybit V5: snapshot or delta
+    exchange_ts: Optional[int] = None # MS precision (Rule 18.4)
     
     @property
     def is_snapshot(self) -> bool:
@@ -128,3 +145,15 @@ class ConnectionRestoredEvent(BaseEvent):
     source: str             # "BybitWS", "WSWorker_0", "ZMQ_Bridge"
     downtime_seconds: float # Measured gap duration
     reconnect_count: int = 0
+
+class SystemBlindnessEvent(BaseEvent):
+    """
+    [GEKTOR v10.0] Critical "Red Alert" Event.
+    Fired when a Silent Zombie connection is detected (Exchange stops sending data, but TCP remains open).
+    Invalidates Radar accuracy and alerts the operator.
+    """
+    source: str         # "WSWorker_0", "Shard_1", etc.
+    symbol: str         # Symbol that went blind
+    reason: str         # "Stale-Skew", "Zero-Derivative", "OS-Socket-Freeze"
+    stale_ms: int       # Age of last valid message
+    is_active: bool = True

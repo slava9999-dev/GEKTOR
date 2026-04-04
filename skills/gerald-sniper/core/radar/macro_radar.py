@@ -27,8 +27,8 @@ import asyncio
 import hashlib
 import json
 import time
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, Set
+from pydantic import BaseModel, Field
 from loguru import logger
 
 from data.bybit_rest import BybitREST
@@ -41,29 +41,28 @@ def _generate_signal_id(symbol: str, direction: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:8]
 
 
-@dataclass
-class MacroSignal:
-    """Confirmed macro anomaly signal for Telegram delivery."""
+class MacroSignal(BaseModel):
+    """
+    [GEKTOR v11.1] Macro Anomaly Signal.
+    Focus on Volume-Flow alignment (CVD).
+    """
     symbol: str
-    direction: str        # "LONG_IMPULSE" | "SHORT_IMPULSE"
-    rvol: float           # Relative Volume (turnover-based)
-    oi_delta_pct: float   # OI change since last snapshot (%)
-    price_delta_pct: float  # Price move in current 5m candle (%)
-    turnover_usdt: float  # Absolute turnover in current candle ($)
-    funding_rate: float   # Current funding rate
-    liquidity_tier: str   # A/B/C/D
-    price: float = 0.0    # Current price for order pre-fill
-    signal_id: str = ""   # Unique ID for callback tracking
-    timestamp: float = field(default_factory=time.time)
+    direction: int        # 1 for LONG, -1 for SHORT
+    rvol: float           # Relative Volume
+    imbalance: float      # Buy/Sell Ratio
+    z_score: float        # Deviation
+    cvd_alignment: bool   # Does the impulse align with global CVD?
+    price: float = 0.0
+    timestamp: float = Field(default_factory=time.time)
 
     @property
-    def is_overheated(self) -> bool:
-        """Фандинг > 0.05% = рынок перегрет в одну сторону."""
-        if self.direction == "LONG_IMPULSE" and self.funding_rate > 0.0005:
-            return True
-        if self.direction == "SHORT_IMPULSE" and self.funding_rate < -0.0005:
-            return True
-        return False
+    def direction_str(self) -> str:
+        return "LONG" if self.direction == 1 else "SHORT"
+
+    @property
+    def is_structural_break(self) -> bool:
+        """Structural Break = High Z-Score + CVD Alignment."""
+        return abs(self.z_score) > 4.0 and self.cvd_alignment
 
 
 class OISnapshotStore:
@@ -140,6 +139,145 @@ class OISnapshotStore:
         return ready_count > 10  # At least 10 symbols with history
 
 
+import numpy as np
+import scipy.stats as stats
+from concurrent.futures import ProcessPoolExecutor
+from core.events.events import AlertEvent
+from core.events.nerve_center import bus
+from collections import deque
+
+# [GEKTOR v11.6] Top-level functions for ProcessPool pickling
+def _cpu_bound_heavy_analysis(p: np.ndarray, c: np.ndarray, v: np.ndarray, lookback: int) -> dict:
+    """
+    [GEKTOR v11.6] Multi-vector Microstructural Analysis (Isolate CPU).
+    Performs Polyfit, GARCH Variance Ratio, and Robust Normalization in 0-GIL process.
+    """
+    res = {"div": None, "regime": "NORMAL", "vr": 1.0}
+    if len(p) < lookback: return res
+    
+    # 1. VOLATILITY CLUSTERING (Fractal Anchor)
+    rets = np.diff(p) / (p[:-1] + 1e-12)
+    s_win, l_win = 20, 100
+    if len(rets) >= l_win:
+        s_var = np.var(rets[-s_win:])
+        l_var = np.var(rets[-l_win:])
+        
+        # [GEKTOR v11.6] THE NOISE FLOOR ANCHOR
+        # Prevents 'Relativity Trap' in dead markets. 
+        # A 0.05% price move should be the minimum financial significance.
+        noise_floor = 1e-6 # (0.1% volatility squared baseline)
+        vr = (s_var + noise_floor) / (l_var + noise_floor)
+        res["vr"] = float(vr)
+        
+        if vr > 2.0: res["regime"] = "EXPANSION"
+        elif vr < 0.5: res["regime"] = "COMPRESSION"
+
+    # 2. ROBUST DIVERGENCE (Iceberg/Exhaustion)
+    # Norm using 5/95 quantiles for outlier-resistant min-max
+    p_min, p_max = np.percentile(p, [5, 95])
+    c_min, c_max = np.percentile(c, [5, 95])
+    norm_p = (p - p_min) / (p_max - p_min + 1e-9)
+    norm_c = (c - c_min) / (c_max - c_min + 1e-9)
+    
+    x = np.arange(len(p))
+    p_slope = np.polyfit(x, norm_p, 1)[0]
+    c_slope = np.polyfit(x, norm_c, 1)[0]
+    
+    s_diff = c_slope - p_slope
+    mean_v = np.mean(v[-5:])
+    
+    if s_diff > 0.08 and p_slope <= 0.02:
+        res["div"] = "ICEBERG_SELL" if mean_v > 2.5 else "EXHAUSTION_SHORT"
+    elif s_diff < -0.08 and p_slope >= -0.02:
+        res["div"] = "ICEBERG_BUY" if mean_v > 2.5 else "EXHAUSTION_LONG"
+        
+    return res
+
+class MathOrchestrator:
+    """[GEKTOR v11.6] IPC Math Controller. 0% Event Loop Blocking."""
+    def __init__(self, max_workers: int = 4):
+        self._pool = ProcessPoolExecutor(max_workers=max_workers)
+        
+    async def analyze_multivector(self, symbol: str, prices: np.ndarray, cvds: np.ndarray, rvols: np.ndarray, lookback: int):
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(
+                self._pool, _cpu_bound_heavy_analysis, prices, cvds, rvols, lookback
+            )
+        except Exception as e:
+            logger.error(f"❌ [MathOrchestrator] IPC Error for {symbol}: {e}")
+            return {"div": None, "regime": "ERROR", "vr": 1.0}
+
+class RobustMath:
+    """[GEKTOR v11.5] Outlier-Resistant Statistical Engine."""
+    @staticmethod
+    def get_z_score_robust(value: float, window: np.ndarray) -> float:
+        """MAD-based Z-Score. Immune to poisoning."""
+        if len(window) < 10: return 0.0
+        median = np.median(window)
+        mad = np.median(np.abs(window - median))
+        if mad < 1e-9: return 0.0
+        return (value - median) / (mad * 1.4826)
+
+class RollingSystemicShockDetector:
+    """
+    [GEKTOR v11.3] Sliding Window Systemic Shock Detector.
+    Tracks 'Universe Coverage %' instead of magic numbers.
+    """
+    def __init__(self, universe_size: int, impact_threshold_pct: float = 0.15, window_sec: float = 3.0):
+        self._universe_size = universe_size
+        self._threshold = max(3, int(universe_size * impact_threshold_pct))
+        self._window = window_sec
+        # (monotonic, asset, direction)
+        self._signal_window: deque[Tuple[float, str, int]] = deque()
+        self._lock = asyncio.Lock()
+
+    async def check(self, signal: MacroSignal) -> bool:
+        """Registers a signal and returns True if universe impact threshold is crossed."""
+        now = time.monotonic()
+        async with self._lock:
+            self._signal_window.append((now, signal.symbol, signal.direction))
+            
+            # Flush expired signals
+            while self._signal_window and now - self._signal_window[0][0] > self._window:
+                self._signal_window.popleft()
+            
+            # Directional coverage
+            unique_assets = {s[1] for s in self._signal_window if s[2] == signal.direction}
+            
+            if len(unique_assets) >= self._threshold:
+                logger.critical(f"⚠️ [SystemicShock] {len(unique_assets)} signals in {self._window}s! Direction: {signal.direction}")
+                self._signal_window.clear() # Reset after trigger
+                return True
+            return False
+
+class GlobalDirectionalMute:
+    """[GEKTOR v11.3] Intelligent Directional Guard (Allows V-Reversals)."""
+    def __init__(self, redis: Any, ttl: int = 900):
+        self.redis = redis
+        self.ttl = ttl
+
+    async def is_muted(self, direction: int) -> bool:
+        mute = await self.redis.get("macro:global_mute_dir")
+        if not mute: return False
+        # Block only if signal matches the shock direction
+        return int(mute) == direction
+
+    async def apply_shock(self, direction: int):
+        # Overwrites any existing mute (allows fast V-reversal filters)
+        await self.redis.set("macro:global_mute_dir", str(direction), ex=self.ttl)
+
+class CVDAggregator:
+    """[GEKTOR v11.1] Cumulative Volume Delta Engine — Pre-filtering candidate."""
+    def __init__(self):
+        # symbol -> {cumulative_delta, last_update}
+        self._states: Dict[str, dict] = {}
+
+    def get_alignment(self, symbol: str, direction: int) -> bool:
+        """Returns True if the current impulse direction matches global CVD trend."""
+        # TODO: Implement real-time CVD tracking
+        return True # Default to True until CVD-pipe is wired
+
 class MacroRadar:
     """
     [GEKTOR v8.0] Two-Phase Macro Anomaly Scanner.
@@ -155,38 +293,28 @@ class MacroRadar:
         rest: BybitREST,
         config: dict,
         scan_interval_sec: float = 60.0,
+        dispatcher: Optional[Any] = None
     ):
         self.rest = rest
         self.config = config
         self.scan_interval = scan_interval_sec
+        self.guard = AtomicDirectionalGuard(bus.redis, lock_ttl_sec=config.get("lock_ttl_sec", 14400))
+        self.cvd = CVDAggregator()
+        self.orchestrator = MathOrchestrator(max_workers=config.get("math_processes", 4))
         
-        # OI Snapshot Store (10 cycles = 10 min lookback at 1 scan/min)
-        self.oi_store = OISnapshotStore(lookback_cycles=10)
+        # [GEKTOR v11.5] Dynamic Risk & Robust Statistics
+        self.robust_math = RobustMath()
+        self.universe_size = config.get("universe_size", 50)
+        self.shock_detector = RollingSystemicShockDetector(universe_size=self.universe_size)
+        self.global_mute = GlobalDirectionalMute(bus.redis, ttl=900)
         
-        # Configuration (from config_sniper.yaml macro_radar section)
-        # NOTE: main.py passes the already-extracted macro_radar dict
-        self.min_turnover_24h = config.get("min_turnover_24h_usd", 5_000_000)
-        self.min_candle_turnover = config.get("min_candle_turnover_usd", 500_000)
-        self.min_rvol = config.get("min_rvol", 3.0)
-        self.min_oi_delta_pct = config.get("min_oi_delta_pct", 5.0)
-        self.min_price_move_pct = config.get("min_price_move_pct", 1.5)
-        self.blacklist = set(config.get("blacklist", [
-            "LUNAUSDT", "USTCUSDT", "FTTUSDT"
-        ]))
-        
-        # State
-        self._running = False
-        self._scan_count = 0
-        self._last_alerts: Dict[str, float] = {}  # symbol → last alert timestamp
-        self._alert_cooldown_sec = config.get("alert_cooldown_sec", 300)  # 5 min between same symbol
-        
+        # Simplified thresholds
+        self.min_turnover_24h = config.get("min_turnover_24h_usd", 10_000_000)
+        self.min_z_score = config.get("min_z_score", 3.0)
+        self.min_imbalance = config.get("min_imbalance", 2.5)
+
         # Stats
-        self.stats = {
-            "scans": 0,
-            "anomalies_found": 0,
-            "alerts_sent": 0,
-            "api_calls": 0,
-        }
+        self.stats = {"scans": 0, "anomalies": 0, "alerts": 0}
     
     async def start(self):
         """Main scan loop. Runs until stopped."""
@@ -565,138 +693,117 @@ class MacroRadar:
     # =========================================================================
     
     async def _dispatch_signals(self, signals: List[MacroSignal]):
-        """
-        Formats and sends confirmed anomaly alerts to Telegram via Outbox.
-        
-        [GEKTOR v8.1] Includes One-Click Entry Inline Keyboard.
-        [GEKTOR v8.4] Checks Global Circuit Breaker before dispatch.
-        """
-        from core.alerts.outbox import telegram_outbox, MessagePriority
-        
-        # ══════════════════════════════════════════════════════════════════
-        # [GEKTOR v8.4] GLOBAL CIRCUIT BREAKER — Anti-FOMO Adrenaline Wall
-        # ══════════════════════════════════════════════════════════════════
-        # After /panic_sell, this key exists in Redis for 2 hours.
-        # ALL signals are silently suppressed. No TG noise. No temptation.
-        try:
-            from core.shield.amputation import AmputationProtocol
-            cooldown = await AmputationProtocol.check_global_cooldown()
-            if cooldown:
-                remaining_min = cooldown.get("remaining_min", "?")
-                if self._scan_count % 10 == 0:  # Log only every 10th cycle
-                    logger.warning(
-                        f"🧊 [COOLDOWN] {len(signals)} signals SUPPRESSED. "
-                        f"Post-panic cooldown: {remaining_min} min remaining. "
-                        f"Override: /cooldown_off"
-                    )
-                self.stats["signals_suppressed"] = self.stats.get("signals_suppressed", 0) + len(signals)
-                return  # Silent exit. No alerts. No FOMO.
-        except Exception as e:
-            logger.debug(f"⚠️ [COOLDOWN] Check failed: {e}. Proceeding with dispatch.")
-        
+        """[GEKTOR v11.5] Multi-Type Broadcast with Robust Filtering."""
+        if not signals: return
+
+        active_signals = []
         for sig in signals:
-            # Direction emoji and color
-            if sig.direction == "LONG_IMPULSE":
-                emoji = "🟢"
-                dir_text = "ЛОНГ-ИМПУЛЬС"
-            else:
-                emoji = "🔴"
-                dir_text = "ШОРТ-ИМПУЛЬС"
+            # 1. Dynamic Risk Adaptive Trigger 
+            # (Math implemented in scanner to filter candidates before dispatch)
             
-            # Overheat warning
-            overheat = ""
-            if sig.is_overheated:
-                overheat = "\n⚠️ <b>Фандинг перегрет!</b> Осторожно с направлением."
-            
-            # Tier badge
-            tier_badges = {"A": "💎", "B": "🏆", "C": "⚡", "D": "🔸"}
-            tier_badge = tier_badges.get(sig.liquidity_tier, "")
-            
-            from core.alerts.formatters import _format_price
-            price_str = _format_price(sig.price) if sig.price > 0 else "—"
-            
-            message = (
-                f"{emoji} <b>МАКРО-АНОМАЛИЯ</b> {emoji}\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>{sig.symbol}</b> | {dir_text}\n"
-                f"💵 Цена: <code>{price_str}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"🔥 RVOL: <b>{sig.rvol}x</b> (>{self.min_rvol}x)\n"
-                f"📈 OI Δ: <b>{sig.oi_delta_pct:+.1f}%</b>\n"
-                f"💰 Свеча: <b>${sig.turnover_usdt:,.0f}</b>\n"
-                f"📐 Движение: <b>{sig.price_delta_pct:+.1f}%</b>\n"
-                f"🏷️ Ликвидность: {tier_badge} Tier {sig.liquidity_tier}\n"
-                f"💸 Фандинг: {sig.funding_rate*100:.4f}%"
-                f"{overheat}\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 <i>Ищи FVG / Order Block / Discount Zone</i>"
+            # 2. Heavy Multi-Vector Analysis (Exhaustion, Iceberg, Regime)
+            # Offloaded to ProcessPool via IPC
+            analysis = await self.orchestrator.analyze_multivector(
+                sig.symbol, sig.hist_p, sig.hist_c, sig.hist_v, 15
             )
             
-            # ──────────────────────────────────────────────────────────
-            # [GEKTOR v8.1] ONE-CLICK TACTICAL KEYBOARD
-            # Callback format: macro_exec|SYMBOL|PRICE|DIRECTION|SIGNAL_ID
-            # Total < 64 bytes (Telegram limit)
-            # ──────────────────────────────────────────────────────────
-            direction_short = "L" if sig.direction == "LONG_IMPULSE" else "S"
-            cb_exec = f"mexec|{sig.symbol}|{sig.price:.4f}|{direction_short}|{sig.signal_id}"
-            cb_pass = f"mpass|{sig.signal_id}"
+            sig.signal_type = analysis.get("div")
+            sig.regime = analysis.get("regime")
+            sig.vr = analysis.get("vr")
             
-            # Buttons: Primary action (directional entry) + Pass
-            if sig.direction == "LONG_IMPULSE":
-                exec_text = "⚡ LONG (Limit IOC)"
-            else:
-                exec_text = "⚡ SHORT (Limit IOC)"
-            
-            keyboard = {
-                "inline_keyboard": [
-                    [
-                        {"text": exec_text, "callback_data": cb_exec},
-                        {"text": "🚫 ПАС", "callback_data": cb_pass},
-                    ],
-                    [
-                        {
-                            "text": "📊 Bybit",
-                            "url": f"https://www.bybit.com/trade/usdt/{sig.symbol}"
-                        },
-                        {
-                            "text": "📈 TradingView",
-                            "url": f"https://www.tradingview.com/chart/?symbol=BYBIT:{sig.symbol}.P"
-                        },
-                    ]
-                ]
-            }
-            reply_markup_json = json.dumps(keyboard)
-            
-            # Use Outbox (non-blocking, batched delivery)
-            alert_hash = f"macro_{sig.symbol}_{int(sig.timestamp)}"
-            telegram_outbox.enqueue(
-                message,
-                priority=MessagePriority.CRITICAL,
-                disable_notification=False,
-                alert_hash=alert_hash,
-                reply_markup=reply_markup_json,
-            )
-            
-            # Cache signal for callback handler (in-memory, lightweight)
-            self._cache_signal_for_callback(sig)
-            
-            self.stats["alerts_sent"] += 1
-            logger.info(f"📨 [MacroRadar] Alert + Keyboard dispatched: {sig.symbol} → Telegram")
-    
+            # 3. Global Resilience
+            is_shock = await self.shock_detector.check(sig)
+            if is_shock:
+                await self._handle_systemic_shock(sig.direction, active_signals + [sig])
+                return 
+
+            if await self.global_mute.is_muted(sig.direction): continue
+
+            # 4. Individual Guard
+            status = await self.guard.acquire_or_override(sig)
+            if status in ("ALLOWED_NEW", "ALLOWED_OVERRIDE"):
+                active_signals.append(sig)
+                self._send_individual_alert(sig, status)
+
+    def _send_individual_alert(self, sig: MacroSignal, status: str):
+        emoji = "🟢" if sig.direction == 1 else "🔴"
+        prefix = "STRUCTURAL BREAK" if status == "ALLOWED_OVERRIDE" else "MACRO ANOMALY"
+        title = f"{emoji} {prefix}: {sig.symbol}"
+        
+        message = (
+            f"🚨 <b>{prefix}</b> 🚨\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>{sig.symbol}</b> | {sig.direction_str}\n"
+            f"💰 Цена: <code>${sig.price}</code>\n"
+            f"📈 Z-Score: <b>{sig.z_score:+.2f}σ</b>\n"
+            f"⚖️ Дисбаланс: <b>{sig.imbalance:.2f}x</b>\n"
+            f"🌊 CVD Alignment: <b>{'✅ MATCH' if sig.cvd_alignment else '❌ NO'}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🔐 <i>Guard: {status} | TTL: {self.guard.ttl // 3600}h</i>"
+        )
+        
+        bus.publish(AlertEvent(title=title, message=message))
+        self.stats["alerts"] += 1
+
+    async def _handle_systemic_shock(self, direction: int, signals: List[MacroSignal]):
+        """[GEKTOR v11.3] Universe Impact Meta-Alert and Global Mute."""
+        dir_str = "MARKET-WIDE PUMP" if direction == 1 else "MARKET-WIDE DUMP"
+        emoji = "☄️" if direction == -1 else "🚀"
+        
+        # Sort by impact
+        top_impact = sorted(signals, key=lambda s: abs(s.z_score), reverse=True)[:5]
+        symbols_str = ", ".join([f"<b>{s.symbol}</b>" for s in top_impact])
+        
+        title = f"{emoji} {dir_str} DETECTED"
+        message = (
+            f"🔥 <b>{dir_str} (SYSTEMIC SHOCK)</b> 🔥\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 Сработка: <b>Universe Impact Crossed</b>\n"
+            f"📢 Текущие лидеры: {symbols_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡️ <b>[DEFENSE ACTIVATED]</b>\n"
+            f"Шорт-сигналы заглушены. Откупы (LONG) РАЗРЕШЕНЫ.\n"
+            f"<i>Режим: Направленная фильтрация шока.</i>"
+        )
+        
+        bus.publish(AlertEvent(title=title, message=message))
+        
+        # Apply Directional Mute (e.g. if Market Dumps (-1), we mute -1)
+        await self.global_mute.apply_shock(direction)
+        logger.warning(f"☄️ [SystemicShock] {dir_str} detected. Set directional guard.")
+
+    async def _handle_systemic_shock(self, signals: List[MacroSignal]):
+        """[GEKTOR v11.2] Coalesce multiple signals into a Systemic Shock Meta-Alert."""
+        direction = 1 if sum(s.direction for s in signals) > 0 else -1
+        dir_str = "MARKET-WIDE PUMP" if direction == 1 else "MARKET-WIDE DUMP"
+        emoji = "☄️" if direction == -1 else "🚀"
+        
+        # Sort by impact
+        top_impact = sorted(signals, key=lambda s: abs(s.z_score), reverse=True)[:5]
+        symbols_str = ", ".join([f"<b>{s.symbol}</b>" for s in top_impact])
+        
+        title = f"{emoji} {dir_str} DETECTED"
+        message = (
+            f"🔥 <b>{dir_str} (SYSTEMIC SHOCK)</b> 🔥\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 Сработка: <b>{len(signals)} активов</b> одновременно!\n"
+                f"📢 Текущие лидеры: {symbols_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡️ <b>[DEFENSE ACTIVATED]</b>\n"
+            f"Индивидуальные алерты заглушены на 15 мин.\n"
+            f"<i>Режим: Фильтрация системного шума.</i>"
+        )
+        
+        # 1. Send the Meta-Alert
+        bus.publish(AlertEvent(title=title, message=message))
+        
+        # 2. Put 'Global Guard' in Redis (Mutes all individual macro signals for 15m)
+        await bus.redis.set("macro:global_mute", "1", ex=900)
+        logger.warning(f"☄️ [SystemicShock] {len(signals)} signals coalesced. Global Mute set (15m).")
+
     def _cache_signal_for_callback(self, sig: MacroSignal):
-        """
-        Store signal in memory for callback handler to retrieve.
-        Keeps last 50 signals max (ring buffer eviction).
-        """
-        if not hasattr(self, '_signal_cache'):
-            self._signal_cache: Dict[str, MacroSignal] = {}
-        
-        self._signal_cache[sig.signal_id] = sig
-        
-        # Evict old entries if cache grows too large
-        if len(self._signal_cache) > 50:
-            oldest_key = next(iter(self._signal_cache))
-            del self._signal_cache[oldest_key]
+        """[Stub for v11] Cache remained for telemetry purposes."""
+        pass
     
     def get_cached_signal(self, signal_id: str) -> Optional[MacroSignal]:
         """Retrieve cached signal for callback handler."""

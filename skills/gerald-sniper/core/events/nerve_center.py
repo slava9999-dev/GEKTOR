@@ -20,11 +20,12 @@ class NerveCenter:
     1. Volatile Pub/Sub (for Ticks/L2/BookDeltas) -> Fast, Lossy.
     2. Persistent Streams (for Signals/Orders/Alerts) -> Guaranteed Delivery.
     """
-    def __init__(self):
+    def __init__(self, prefix: str = ""):
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6381/0")
         password = os.getenv("REDIS_PASSWORD", None)
         self.redis = aioredis.from_url(redis_url, password=password, decode_responses=True)
         self.pubsub = self.redis.pubsub()
+        self.prefix = f"{prefix}:" if prefix else ""
         self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
         self._stream_subscribers: Dict[str, List[Callable]] = defaultdict(list)
         self._event_types: Dict[str, Type[BaseModel]] = {}
@@ -52,16 +53,17 @@ class NerveCenter:
         Hardened publish with persistent storage option.
         """
         name = type(event).__name__
+        channel = f"{self.prefix}{name}"
         payload = event.model_dump_json()
         
         try:
             if persistent:
                 # [Audit 28.4] Redis Stream XADD (Capped to 10k messages to avoid OOM)
-                await self.redis.xadd(f"stream:{name}", {"payload": payload}, maxlen=10000, approximate=True)
+                await self.redis.xadd(f"{self.prefix}stream:{name}", {"payload": payload}, maxlen=10000, approximate=True)
             else:
-                await self.redis.publish(name, payload)
+                await self.redis.publish(channel, payload)
         except Exception as e:
-            logger.error(f"❌ [NerveCenter] Publish failed ({name}): {e}")
+            logger.error(f"❌ [NerveCenter] Publish failed ({channel}): {e}")
 
     @property
     def is_connected(self) -> bool:
@@ -81,7 +83,7 @@ class NerveCenter:
         """Standard Volatile Loop."""
         while self._listening:
             try:
-                channels = list(self._subscribers.keys())
+                channels = [f"{self.prefix}{name}" for name in self._subscribers.keys()]
                 if not channels:
                     await asyncio.sleep(2); continue
                 
@@ -96,7 +98,11 @@ class NerveCenter:
 
                 async for msg in self.pubsub.listen():
                     if msg["type"] == "message":
-                        await self._dispatch(msg["channel"], msg["data"], is_stream=False)
+                        # Remove prefix for internal dispatch
+                        chan = msg["channel"]
+                        if self.prefix and chan.startswith(self.prefix):
+                            chan = chan[len(self.prefix):]
+                        await self._dispatch(chan, msg["data"], is_stream=False)
             except Exception as e:
                 logger.warning(f"⚠️ [NerveCenter] PubSub Loop error: {e}")
                 await asyncio.sleep(1)
@@ -108,7 +114,7 @@ class NerveCenter:
         """
         while self._listening:
             try:
-                streams_to_read = {f"stream:{name}": ">" for name in self._stream_subscribers.keys()}
+                streams_to_read = {f"{self.prefix}stream:{name}": ">" for name in self._stream_subscribers.keys()}
                 if not streams_to_read:
                     await asyncio.sleep(2); continue
 
@@ -122,7 +128,7 @@ class NerveCenter:
                             raise
                 
                 # Also check for pending messages
-                pending_streams = {f"stream:{name}": "0-0" for name in self._stream_subscribers.keys()}
+                pending_streams = {f"{self.prefix}stream:{name}": "0-0" for name in self._stream_subscribers.keys()}
                 
                 # XREADGROUP (Blocking call)
                 response = await self.redis.xreadgroup(
@@ -144,7 +150,8 @@ class NerveCenter:
 
                 if response:
                     for stream_name, messages in response:
-                        channel = stream_name.replace("stream:", "")
+                        # Remove prefix and 'stream:' for internal dispatch
+                        channel = stream_name.replace(f"{self.prefix}stream:", "")
                         for msg_id, data in messages:
                             payload = data.get("payload")
                             if payload:
@@ -167,7 +174,8 @@ class NerveCenter:
             # If it's a stream message and no handlers, we should still ACK it to prevent it from staying pending
             if is_stream and msg_id:
                 try:
-                    await self.redis.xack(f"stream:{channel}", self._consumer_group, msg_id)
+                    stream_key = f"{self.prefix}stream:{channel}"
+                    await self.redis.xack(stream_key, self._consumer_group, msg_id)
                     logger.debug(f"✅ [NerveCenter] Acknowledged stream message {msg_id} for {channel} (no handlers)")
                 except Exception as ack_e:
                     logger.error(f"❌ [NerveCenter] Failed to ACK stream message {msg_id} for {channel} (no handlers): {ack_e}")
@@ -186,7 +194,8 @@ class NerveCenter:
             
             # [Audit 28.6] Acknowledge Stream Message after all handlers have been dispatched
             if is_stream and msg_id:
-                await self.redis.xack(f"stream:{channel}", self._consumer_group, msg_id)
+                stream_key = f"{self.prefix}stream:{channel}"
+                await self.redis.xack(stream_key, self._consumer_group, msg_id)
                 
         except Exception as e:
             logger.error(f"❌ [NerveCenter] Dispatch Error on {channel} (msg_id: {msg_id}): {e}")

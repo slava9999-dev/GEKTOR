@@ -24,3 +24,10 @@ class LogThrottler:
         return False
 
 log_throttler = LogThrottler()
+
+def generate_sortable_id() -> str:
+    """[GEKTOR v10.3] Time-Sorted ID (Timestamp + Random) for Redis ZSET scoring."""
+    import time
+    from uuid import uuid4
+    # MS Precision + Random Hex (Total: 13 + 8 = 21 chars)
+    return f"{int(time.time() * 1000)}_{uuid4().hex[:8]}"

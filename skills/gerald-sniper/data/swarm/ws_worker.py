@@ -1,5 +1,6 @@
 import asyncio
 import time
+import os
 import orjson
 import websockets
 from typing import List, Set, Any, Optional
@@ -90,9 +91,16 @@ class WSWorker:
                     
                     try:
                         async for msg in ws:
-                            # [Audit 27.1] Non-blocking Ingestion
+                            # 1. Non-blocking Bridge Ingestion (Shard path)
                             self.bridge.ingest_raw(msg)
                             self.last_msg_ts = time.time()
+                            
+                            # 2. Local Logic (Seq tracking, Liveness)
+                            try:
+                                payload = orjson.loads(msg)
+                                await self._handle_message(payload)
+                            except Exception as e:
+                                logger.error(f"Decode error on worker {self.worker_id}: {e}")
                     except Exception as e:
                         logger.warning(f"⚠️ [Worker {self.worker_id}] Connection lost: {e}")
                     finally:
@@ -109,21 +117,38 @@ class WSWorker:
         await self.bridge.stop()
 
     async def _heartbeat_watchdog(self):
-        """[Audit 5.15] Zombie Socket Watchdog."""
+        """
+        [GEKTOR v10.0] Advanced Zombie Socket Watchdog.
+        Checks for:
+        1. Ping/Pong failures.
+        2. Absolute silence (10s).
+        3. Sequence Derivative (Frozen while market is active).
+        4. Buffer Skew (Exchange TS vs Local TS).
+        """
         while self._running:
-            await asyncio.sleep(2) # Frequent polling
+            await asyncio.sleep(2) 
             if not self._ws: continue
             
             try:
                 now = time.time()
-                # 1. Active Probe (Bybit Spec)
+                # 1. Active Probe
                 await self._ws.send('{"op":"ping"}')
                 
-                # 2. Silent Drop Check: No messages (data or pongs) for 10s = Death
-                # This catches 'Half-Open' states that standard ping_timeout might miss
+                # 2. Silent Drop Check
                 silence_duration = now - self.last_msg_ts
                 if silence_duration > 10.0:
-                    logger.critical(f"💀 [Worker {self.worker_id}] Zombie Socket (10s Silence). Force Reconnect.")
+                    logger.critical(f"💀 [Worker {self.worker_id}] Zombie Socket (10s Silence).")
+                    await self._ws.close()
+                    continue
+
+                # 3. Buffer Skew (Skew grows but socket is "open")
+                # If last valid message TS is > 500ms behind, and it's been quiet for 2s
+                # we are likely in a zombie state or heavy lag.
+                from core.realtime.market_state import market_state
+                # We check a few liquid symbols to see if the market is active
+                if market_state.check_global_staleness(threshold=5.0):
+                    # Red Alert already triggered by MarketState, but worker will kill itself too
+                    logger.critical(f"💀 [Worker {self.worker_id}] Global Market Staleness. Resetting.")
                     await self._ws.close()
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
@@ -185,9 +210,16 @@ class WSWorker:
         topic = payload.get("topic", "")
         data = payload.get("data")
         u = payload.get("u")
+        ts = payload.get("ts") # Bybit V5 Top-level exchange TS (ms)
         msg_type = payload.get("type", "delta")
         
         is_snap = msg_type == "snapshot"
+        
+        # [GEKTOR v10.0] Stale Data Drop: Zero CPU for dead data
+        # If exchange time is > 1s older than current time, drop immediately.
+        if ts and (time.time() * 1000 - ts) > 1000:
+            if not is_snap: # Never drop snapshots, they restore state
+                return
         
         # Sequence tracking
         if u is not None and topic:
@@ -215,11 +247,13 @@ class WSWorker:
 
         # Publish raw event for consumers (CandleCache, MarketState)
         if self.publish_to_bus:
-            asyncio.create_task(bus.publish(RawWSEvent(topic=topic, data=data, u=u, is_snapshot=is_snap)))
+            evt = RawWSEvent(topic=topic, data=data, u=u, is_snapshot=is_snap, exchange_ts=ts)
+            asyncio.create_task(bus.publish(evt))
         
         # Local callback for Shard Logic
         if hasattr(self, 'on_raw_event_cb') and self.on_raw_event_cb:
-            asyncio.create_task(self.on_raw_event_cb(RawWSEvent(topic=topic, data=data, u=u, is_snapshot=is_snap)))
+            evt = RawWSEvent(topic=topic, data=data, u=u, is_snapshot=is_snap, exchange_ts=ts)
+            asyncio.create_task(self.on_raw_event_cb(evt))
 
 
     async def force_reconnect_topic(self, topic: str):

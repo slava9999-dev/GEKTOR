@@ -69,6 +69,7 @@ class OutboxMessage:
     alert_hash: str = ""
     error_msg: str = ""
     telegram_msg_id: Optional[int] = None
+    signal_id: Optional[str] = None
 
 
 class TelegramOutbox:
@@ -117,7 +118,8 @@ class TelegramOutbox:
                 last_attempt REAL DEFAULT 0,
                 alert_hash TEXT DEFAULT '',
                 error_msg TEXT DEFAULT '',
-                telegram_msg_id INTEGER
+                telegram_msg_id INTEGER,
+                signal_id TEXT
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, priority, created_at)")
@@ -141,6 +143,7 @@ class TelegramOutbox:
         reply_markup: Optional[str] = None,
         alert_hash: str = "",
         status: str = "pending",
+        signal_id: Optional[str] = None,
     ) -> bool:
         """
         Add a message to the outbox.
@@ -180,13 +183,13 @@ class TelegramOutbox:
             """INSERT INTO outbox
                (text, parse_mode, disable_notification, reply_to_message_id,
                 reply_markup, priority, status, retries, max_retries,
-                created_at, alert_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                created_at, alert_hash, signal_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
             (
                 text, parse_mode, int(disable_notification),
                 reply_to_message_id, reply_markup,
                 int(priority), status,
-                self.MAX_RETRIES, now, alert_hash,
+                self.MAX_RETRIES, now, alert_hash, signal_id,
             ),
         )
         conn.commit()
@@ -225,6 +228,7 @@ class TelegramOutbox:
                 alert_hash=r["alert_hash"],
                 error_msg=r["error_msg"],
                 telegram_msg_id=r["telegram_msg_id"],
+                signal_id=r["signal_id"],
             )
             messages.append(msg)
         return messages
@@ -386,6 +390,17 @@ class TelegramOutbox:
                         )
                         self._hourly_sends.append(time.time())
                         self._stats["sent"] += 1
+                        
+                        # Task 24.6: If it was a signal, notify LifecycleManager to link UI
+                        if msg.signal_id:
+                            from core.events.events import SignalLifecycleEvent
+                            asyncio.create_task(bus.publish(SignalLifecycleEvent(
+                                signal_id=msg.signal_id,
+                                action="SENT",
+                                chat_id=config.telegram.chat_id,
+                                message_id=tg_msg_id
+                            )))
+                        
                         logger.debug(f"📤 Outbox sent #{msg.id} (tg_id={tg_msg_id}, hour={len(self._hourly_sends)}/{self.MAX_MESSAGES_PER_HOUR})")
                     else:
                         new_retries = msg.retries + 1
@@ -449,23 +464,23 @@ class TelegramOutbox:
                 logger.debug(f"🔇 [Outbox] Signal {event.symbol} imbalance {imbalance} < 1.2. Suppressed.")
                 return
             
+            # [GEKTOR v11.0] Pure Text Mode (Interactive Amputated)
             from core.alerts.formatters import format_signal_alert
-            msg, buttons = format_signal_alert(event)
+            msg, _ = format_signal_alert(event)
             
             alert_hash = self.compute_alert_hash(
-                event.symbol, "SIGNAL_MOBILE", str(score_int)
+                event.symbol, "SIGNAL_QUIET", str(score_int)
             )
             
-            # For Score > 90, we always want sound and high priority
             self.enqueue(
                 text=msg,
-                priority=MessagePriority.CRITICAL,
-                disable_notification=False,
-                reply_markup=buttons,
+                priority=MessagePriority.NORMAL,
+                disable_notification=True,
+                reply_markup=None, # Amputated
                 alert_hash=alert_hash,
                 status="pending"
             )
-            logger.info(f"📬 [Mobile Sniper] ALERT enqueued for {event.symbol} (Score: {score_int})")
+            logger.info(f"📬 [Quiet Mode] Signal logged for {event.symbol}")
         except Exception as e:
             logger.error(f"❌ [Outbox] Error handling SignalEvent: {e}")
 

@@ -192,21 +192,8 @@ def format_signal_alert(event: SignalEvent) -> tuple[str, str]:
         f"<i>Gerald Sniper v5.2</i>"
     )
     
-    # 5. Interactive Buttons
-    markup = {
-        "inline_keyboard": [[
-            {
-                "text": "⚡ ВХОД (Limit IOC)", 
-                "callback_data": f"exec|{event.symbol}|{event.price:.6f}|{event.signal_id}"
-            },
-            {
-                "text": "🚫 ПАС", 
-                "callback_data": f"pass|{event.signal_id}"
-            }
-        ]]
-    }
-    
-    return msg, json.dumps(markup)
+    # [GEKTOR v11.0] Amputated: Pure Macro Text Mode
+    return msg, None
 
 
 def _build_market_description(signal_type: str, factors: set, meta: dict) -> str:

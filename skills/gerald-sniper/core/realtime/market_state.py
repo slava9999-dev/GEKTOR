@@ -65,6 +65,7 @@ class LiveMarketState:
              return # Squelch anomalous spikes
 
         state.update(price, qty, side)
+        state.last_trade_ts = now
         self._last_update_ts[key] = now
         self._stats["updates"] += 1
 
@@ -94,7 +95,7 @@ class LiveMarketState:
         else:
             state.orderbook.apply_delta({"b": bids, "a": asks, "u": update_id})
             
-        self._last_update_ts[key] = now
+        self._last_update_ts[key] = state.last_l2_ts = now
         self._stats["updates"] += 1
 
     def update_bba(self, symbol: str, bid: float, ask: float, ts_ms: int, update_id: int = 0, exchange: str = "bybit"):
@@ -119,7 +120,7 @@ class LiveMarketState:
         state.update_spread(bid, ask) # [Audit 6.7] Dynamic Slippage Input
         state.exchange_ts = ts_ms
         state.update_id = update_id
-        self._last_update_ts[key] = time.time()
+        self._last_update_ts[key] = state.last_l2_ts = time.time()
 
     def update_l2_metrics(self, symbol: str, imbalance: float, bids_usd: float, asks_usd: float, bid: float, ask: float):
         """Update market state with pre-computed L2 metrics from ShardWorker."""
@@ -138,6 +139,7 @@ class LiveMarketState:
         state.micro_imbalance = imbalance  # Assuming this field exists in SymbolLiveState
         state.bid_vol_usd = bids_usd
         state.ask_vol_usd = asks_usd
+        state.last_l2_ts = now
         state.bba_bid = bid
         state.bba_ask = ask
         self._last_update_ts[key] = time.time()
@@ -171,6 +173,31 @@ class LiveMarketState:
         state.liq_history[idx] = [time.time(), price, qty, side_val]
         state.liq_ptr += 1
         self._last_update_ts[key] = time.time()
+
+    def get_price_history(self, symbol: str, start_ts_ms: int, exchange: str = "bybit") -> List[Dict]:
+        """
+        [GEKTOR v10.2] Returns price history for auditing purposes.
+        Scans SymbolLiveState buckets. Resolution: 1s.
+        """
+        state = self.get_state(symbol, exchange)
+        if not state:
+            return []
+            
+        start_ts_sec = int(start_ts_ms / 1000)
+        history = []
+        
+        # Iterate through history_ts and collect bucket data within the window
+        for ts in state.history_ts:
+            if ts >= start_ts_sec:
+                bucket = state.buckets.get(ts)
+                if bucket:
+                    # 'ts' here is unix seconds, convert to ms for consistency with Auditor expectation
+                    history.append({
+                        "ts": ts * 1000,
+                        "price": bucket['price']
+                    })
+        
+        return history
 
     def get_state(self, symbol: str, exchange: str = "bybit") -> Optional[SymbolLiveState]:
         key = self._get_key(exchange, symbol)
@@ -258,9 +285,38 @@ class LiveMarketState:
         # If we have tracked data but NO updates found for ALL liquid pairs, 
         # it's a structural failure (WebSocket freeze).
         if len(self.symbols) > 5 and updates_found == 0:
+            self.broadcast_blindness("GLOBAL_WS_FREEZE", "No updates on liquid pairs (BTC/ETH/SOL)")
             return True # GLOBAL STALENESS DETECTED
             
         return False
+
+    def broadcast_blindness(self, reason: str, details: str):
+        """[GEKTOR v10.0] Activates Red Alert across all components."""
+        logger.critical(f"🚨 [RED ALERT] System Blindness Initiated: {reason} ({details})")
+        
+        for key, state in self.symbols.items():
+            if state and not state.is_blind:
+                state.is_blind = True
+                state.blindness_reason = reason
+                
+        # Broadcast via bus for External Observers (Telegram, etc.)
+        from core.events.events import SystemBlindnessEvent
+        from core.events.nerve_center import bus
+        asyncio.create_task(bus.publish(SystemBlindnessEvent(
+            source="MarketState", 
+            symbol="GLOBAL", 
+            reason=reason, 
+            stale_ms=0
+        )))
+
+    def invalidate_symbol(self, symbol: str, reason: str):
+        """Atomic invalidation of a specific symbol on connection loss."""
+        key = self._get_key("bybit", symbol)
+        state = self.symbols.get(key)
+        if state:
+            state.is_blind = True
+            state.blindness_reason = reason
+            logger.warning(f"🧊 [MarketState] Symbol {symbol} invalidated: {reason}")
 
 # Global Singleton
 market_state = LiveMarketState()

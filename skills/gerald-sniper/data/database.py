@@ -351,7 +351,18 @@ class DatabaseManager:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_symbol_ts ON watchlist_history (symbol, timestamp DESC)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_tier ON watchlist_history (liquidity_tier)"))
 
-            # Optional: TimescaleDB Hypertable & Retention Policy (7 Days)
+            # 7. Kill Switch: System Status persistence
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS system_status (
+                    component VARCHAR(50) PRIMARY KEY,
+                    status VARCHAR(20) NOT NULL,
+                    reason TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                );
+            """))
+            
+            # 8. TimeScaleDB: Hypertables (v3.0 Optimization)
+            # Optional: Enable TimescaleDB hypertable & Retention Policy (7 Days)
             try:
                 await conn.execute(text("SELECT create_hypertable('watchlist_history', 'timestamp', if_not_exists => TRUE);"))
                 await conn.execute(text("SELECT add_retention_policy('watchlist_history', INTERVAL '7 days', if_not_exists => TRUE);"))
