@@ -1,10 +1,31 @@
 version: '3.8'
 
 services:
-  # ХРАНИЛИЩЕ: TimescaleDB для тиков, свечей и стейта ордеров
+  # ЦЕНТРАЛЬНОЕ ЯДРО: GEKTOR APEX Trading Daemon
+  gektor_core:
+    build: .
+    container_name: gektor_core_apex
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://tekton_admin:CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912@blackbox_db/tekton_alpha
+      - REDIS_URL=redis://nerve_center/0
+    volumes:
+      # [TWO-TIER TIME SYNC] Жесткая привязка к часам хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      - blackbox_db
+      - nerve_center
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m" # Лимит логов на диск
+        max-file: "3"
+
+  # ХРАНИЛИЩЕ: TimescaleDB (Postgres 16)
   blackbox_db:
     image: timescale/timescaledb:latest-pg16
-    container_name: tekton_blackbox
+    container_name: gektor_blackbox
     restart: always
     environment:
       - POSTGRES_USER=tekton_admin
@@ -14,22 +35,23 @@ services:
       - "127.0.0.1:5433:5432"
     cpuset: "0-1"
     volumes:
-      - tekton_pgdata_v2:/var/lib/postgresql/data
+      - gektor_pgdata:/var/lib/postgresql/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
 
-  # ШИНА: Redis (Hardened Persistence for AOF/Idempotency)
+  # ШИНА: Redis (Hardened Persistence)
   nerve_center:
     image: redis:7-alpine
-    container_name: tekton_nerve_center
+    container_name: gektor_nerve_center
     restart: always
-    ports:
-      - "127.0.0.1:6381:6379"
-    cpuset: "0-1"
-    # [Hardened] --appendonly yes + --appendfsync everysec ensures maximum durability 
-    # while maintaining HFT-level performance (Task 25.11).
-    command: redis-server --appendonly yes --appendfsync everysec --loglevel warning --requirepass CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912
+    command: redis-server --appendonly yes --appendfsync everysec --requirepass CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912
     volumes:
-      - tekton_redis_data_v2:/data
+      - gektor_redis_data:/data
 
 volumes:
-  tekton_pgdata_v2: # Versioned for v6.27 state migration
-  tekton_redis_data_v2:
+  gektor_pgdata:
+  gektor_redis_data:
+

@@ -1,57 +1,57 @@
-# 🛡️ GEKTOR v12.0 (APEX) — Global Project Standards
+# 🛑 GEKTOR APEX: CORE ARCHITECTURE MANIFESTO (v2.0 STRICT) 🛑
 
 # 🎯 MISSION & IDENTITY
-GEKTOR (Macro-Radar) is an advanced, non-interactive institutional-grade advisory system designed for high-fidelity liquidity monitoring and signal discovery.
+**GEKTOR — ЭТО ИСКЛЮЧИТЕЛЬНО АНАЛИТИЧЕСКИЙ РАДАР. ОН НЕ ТОРГУЕТ.**
+Система предназначена для поиска **среднесрочных аномалий** (Medium-Term) и скрытой институциональной аккумуляции.
 
-**Current Mode:** `MACRO_RADAR` (Advisory)
-**Execution Mode:** `AMPUTATED` (Manual Execution Only)
+- **Status:** MISSION CONTROL [ACTIVE]
+- **Identity:** Analytical Radar (Advisory Only)
+- **Execution:** STRICTLY MANUAL (Operator via Telegram)
+- **Horizon:** 4h to 2w (Medium-Term)
 
 ---
 
-# 📋 DEVELOPMENT PROTOCOLS
+# 🚫 ANTI-PATTERNS (STRICTLY PROHIBITED)
+1. ❌ **HFT/Scalping:** No 1m/1s bars. No micro-OFI for sub-minute entries.
+2. ❌ **Auto-Execution:** No `ExecutionEngine`, `OrderManager`, or direct Broker API integration.
+3. ❌ **Silent Failures:** Never use `except Exception: pass`. All errors must be logged and handled.
+4. ❌ **Event Loop Blocks:** CPU-bound math must reside in `ProcessPoolExecutor`.
+5. ❌ **Asset Siloing:** Never analyze a symbol without BTC/ETH Macro Regime context.
 
-## 1. Zero-GIL Policy (Math Intensive)
-- Use `ProcessPoolExecutor` for all heavy math (Median, MAD, Variance Ratio).
-- Do NOT use `asyncio` for CPU-bound computations; it will freeze the event loop.
-- Use `msgspec` for ultra-fast serialization between processes.
+---
 
-## 2. Low-Latency I/O Sharding
-- Each shard (Bybit Symbol Group) runs in its own process.
-- Use **Redis Pub/Sub** (NerveCenter) for inter-shard communication.
-- Global `RealtimeStateManager` monitors `StatusChangeEvent` for live shard health.
+# 📋 DEVELOPMENT PROTOCOLS (GEKTOR v2.0)
 
-## 3. High-Fidelity Data Ingestion
-- **TradeSweeper**: Always reconstruct fragmented L3 trades into unified "Sweeps".
-- **Pessimistic Fill**: Assume the worst fill (VWAP) when simulating advisor outcomes.
-- **Basis Correction**: Always compare Perpetual price to Spot price (Lead-Lag validation).
+## 1. High-Fidelity Macro Ingestion (Phase 1)
+- **Raw Ticks to Buckets:** Transform WebSocket trades into **Adaptive Dollar Bars**.
+- **Conflation:** Batch L2 updates to minimize processing overhead. No noise.
+
+## 2. Quant Engine & VPIN (Phase 2)
+- **VPIN:** Calculate volume-synchronized toxicity for medium-term accumulation.
+- **FFD (Fractional Differentiation):** Preserve memory while achieving stationarity.
+
+## 3. Meta-Labeling & Validation (Phase 3)
+- **Purged K-Fold CV:** Eliminate data leakage and autocorrelation.
+- **Embargoing:** A mandatory 1% temporal gap between training and testing sets.
+
+## 4. Atomic State Persistence (Phase 4)
+- **Memory Recovery:** All math state (VPIN, CUSUM) must survive container restarts.
+- **Storage:** PostgreSQL/TimescaleDB (Signals) + Redis (Volatile telemetry).
+
+## 5. Decision Support & Abort Mission (Phase 5)
+- **Invalidation:** Generate `[🚨 ABORT MISSION]` alerts if the microstructural premise breaks before the macro goal is met.
 
 ---
 
 # 🛠️ TECHNOLOGY STACK
-- **Back-end:** Python 3.11+
-- **Concurrency:** `asyncio` + `ProcessPoolExecutor` + `msgspec`
-- **Infrastructure:**
-  - **Redis:** Volatile telemetry, Pub/Sub, CUSUM/Sentinel state.
-  - **PostgreSQL (TimescaleDB):** Deep historical bar and signal storage.
-  - **ZeroMQ:** Ultra-low latency IPC between shard workers.
-
----
-
-# 🔒 SAFETY & RESILIENCE
-- **Decay Sentinel (Aegis):** Persistent monitoring of signal expectancy; auto-halt on Alpha decay.
-- **Fail-Fast Boot:** Every module must validate API connectivity and DB state before entering the event loop.
-- **Vitals Watchdog:** Monitors shard heartbeats; triggers auto-respawn on network partitions.
-
----
-
-# 📝 CODE STANDARDS
-- **Typing:** Strict `typing` and `pydantic` models for all data structures.
-- **Error Handling:** Explicit logging with correlation IDs; no silent crashes.
-- **Testing:** `pytest` for all core logic; simulate network gaps in unit tests.
+- **Backend:** Python 3.11+ (Strict Typing)
+- **Framework:** `asyncio` + `ProcessPoolExecutor` (Math)
+- **Messaging:** Redis Pub/Sub (NerveCenter)
+- **Monitoring:** Loguru with structured JSON for observability.
 
 ---
 
 # 🚀 OPERATIONS
-- **Start Up:** `python main.py` or `./run_tekton.ps1`
-- **Alerts:** Institutional-grade reporting via Telegram.
-- **Persistence:** All signals are recorded to TimescaleDB for post-trade analysis.
+- **Start Up:** `python main.py` (Mode: ADVISORY)
+- **Alerts:** Clean, one-way Telegram signal dispatch (Entry/Abort/Heartbeat).
+- **Manifesto Source of Truth:** Read [GEKTOR_MANIFESTO.md](file:///c:/Gerald-superBrain/GEKTOR_MANIFESTO.md) before any architectural change.

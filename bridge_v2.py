@@ -37,7 +37,7 @@ class GeraldBridgeV2:
                     "rpm": 15,
                 },
                 "deepseek": {
-                    "enabled": True,
+                    "enabled": False,
                     "api_key_env": "DEEPSEEK_API_KEY",
                     "base_url": "https://api.deepseek.com/v1",
                     "model": "deepseek-chat",
