@@ -1,19 +1,35 @@
 [tool.mypy]
+strict = true
 ignore_missing_imports = true
 explicit_package_bases = true
 exclude = ["venv", ".venv", "build", "dist"]
 mypy_path = "."
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
 
 [tool.ruff]
 line-length = 120
 exclude = ["venv", ".venv", "build", "dist"]
 src = ["."]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "C",   # flake8-comprehensions
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "PL",  # Pylint
+    "ASYNC" # flake8-async
+]
+ignore = ["PLR0913"] # Allow more than 5 arguments in functions
 
-[tool.pyright]
-include = ["."]
-extraPaths = ["."]
-typeCheckingMode = "basic"
+[tool.ruff.lint.mccabe]
+max-complexity = 15
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

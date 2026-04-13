@@ -4,7 +4,7 @@ import sys
 import json
 from datetime import datetime
 from dotenv import load_dotenv
-import requests
+import aiohttp
 
 # Project Imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -104,20 +104,14 @@ class GeraldBridgeV2:
 
         url = f"https://api.telegram.org/bot{self.token}/getUpdates"
         try:
-            proxies = None
             proxy_url = os.getenv("PROXY_URL")
-            if proxy_url:
-                proxies = {"http": proxy_url, "https": proxy_url}
-                
-            # We use non-blocking request for simplicity or run in executor
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(
-                None,
-                lambda: requests.get(
-                    url, params={"offset": self.offset, "timeout": 20}, timeout=25, proxies=proxies
-                ),
-            )
-            updates = resp.json().get("result", [])
+            # aiohttp handles proxy directly in the request or via connector
+            
+            async with aiohttp.ClientSession() as session:
+                params = {"offset": self.offset, "timeout": 20}
+                async with session.get(url, params=params, proxy=proxy_url, timeout=25) as resp:
+                    data = await resp.json()
+                    updates = data.get("result", [])
             
             # Reset error counter on successful response
             if self._consecutive_errors > 0:
@@ -153,14 +147,8 @@ class GeraldBridgeV2:
                         logger.warning(f"Unauthorized TG callback from {cid}")
         except Exception as e:
             self._consecutive_errors += 1
-            backoff = min(15, 3 * self._consecutive_errors) # Reduced max backoff for standard network drops
-            
-            error_msg = str(e)
-            silent_errors = ["Max retries exceeded", "Read timed out", "Connection aborted", "10054", "502 Bad Gateway", "SSLEOFError"]
-            if any(term in error_msg for term in silent_errors):
-                logger.warning(f"🛜 TG Poll network lag/proxy drop. Retry in {backoff}s...")
-            else:
-                logger.error(f"TG Poll error: {e}. Backing off for {backoff}s...")
+            backoff = min(15, 3 * self._consecutive_errors)
+            logger.warning(f"🛜 TG Poll network lag. Retry in {backoff}s... Error: {e}")
             await asyncio.sleep(backoff)
 
     async def _handle_sniper_command(self, text: str):
@@ -220,15 +208,10 @@ class GeraldBridgeV2:
 
             # Send reply
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            proxies = None
             proxy_url = os.getenv("PROXY_URL")
-            if proxy_url:
-                proxies = {"http": proxy_url, "https": proxy_url}
                 
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, lambda: requests.post(url, json={"chat_id": self.chat_id, "text": reply, "parse_mode": "HTML"}, timeout=10, proxies=proxies)
-            )
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, json={"chat_id": self.chat_id, "text": reply, "parse_mode": "HTML"}, timeout=10, proxy=proxy_url)
         except Exception as e:
             logger.error(f"Sniper command error: {e}")
 
@@ -241,13 +224,10 @@ class GeraldBridgeV2:
             
             # 1. Answer callback
             url = f"https://api.telegram.org/bot{self.token}/answerCallbackQuery"
-            proxies = None
             proxy_url = os.getenv("PROXY_URL")
-            if proxy_url:
-                proxies = {"http": proxy_url, "https": proxy_url}
                 
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: requests.post(url, json={"callback_query_id": cb_id}, timeout=10, proxies=proxies))
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, json={"callback_query_id": cb_id}, timeout=10, proxy=proxy_url)
 
             if data.startswith(("/take_", "/skip_")):
                 parts = data.split("_", 1)
@@ -275,24 +255,22 @@ class GeraldBridgeV2:
                     # Remove inline keyboard
                     import json as _json
                     edit_url = f"https://api.telegram.org/bot{self.token}/editMessageReplyMarkup"
-                    await loop.run_in_executor(
-                        None, lambda: requests.post(edit_url, json={
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(edit_url, json={
                             "chat_id": chat_id,
                             "message_id": message.get("message_id"),
                             "reply_markup": _json.dumps({"inline_keyboard": []})
-                        }, timeout=10, proxies=proxies)
-                    )
+                        }, timeout=10, proxy=proxy_url)
 
                     # Send confirmation
                     msg_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
                     emoji = "✅" if result == "TAKEN" else "⏭️"
-                    await loop.run_in_executor(
-                        None, lambda: requests.post(msg_url, json={
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(msg_url, json={
                             "chat_id": chat_id,
                             "text": f"{emoji} Сигнал #{alert_id} отмечен как {result}.",
                             "reply_to_message_id": message.get("message_id")
-                        }, timeout=10, proxies=proxies)
-                    )
+                        }, timeout=10, proxy=proxy_url)
         except Exception as e:
             logger.error(f"Callback handling error: {e}")
 
@@ -306,16 +284,13 @@ class GeraldBridgeV2:
 
                 # Send typing indicator (non-blocking)
                 typing_url = f"https://api.telegram.org/bot{self.token}/sendChatAction"
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: requests.post(
+                async with aiohttp.ClientSession() as session:
+                    await session.post(
                         typing_url,
                         json={"chat_id": self.chat_id, "action": "typing"},
                         timeout=5,
-                        proxies=proxies,
-                    ),
-                )
+                        proxy=proxy_url,
+                    )
 
                 # 1. Get response from Gerald
                 response = await self.agent.chat(text)
@@ -327,10 +302,8 @@ class GeraldBridgeV2:
                     "text": f"🧠 Gerald (V2.0):\n\n{response}",
                 }
 
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None, lambda: requests.post(url, json=payload, timeout=10, proxies=proxies)
-                )
+                async with aiohttp.ClientSession() as session:
+                    await session.post(url, json=payload, timeout=10, proxy=proxy_url)
                 logger.info("Response sent to Telegram")
             except Exception as e:
                 logger.error(f"Error handling message: {e}")

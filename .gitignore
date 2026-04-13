@@ -147,3 +147,8 @@ dump.rdb
 .agent/
 .gemini/
 .openclaw/
+
+# GEKTOR APEX SECRET SAUCE
+src/domain/math_core.py
+src/shield/circuit_breaker.py
+config.yaml

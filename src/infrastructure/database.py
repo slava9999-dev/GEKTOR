@@ -148,9 +148,64 @@ class DatabaseManager:
 
     async def initialize(self):
         await self.buffer.start()
-        # In a real scenario, we would apply migrations here or create tables
-        # For brevity, I'll trust the existing schema from the audit for now.
-        logger.success("✅ [DB] Infrastructure stabilized.")
+        
+        # Schema Initialization (GEKTOR Protocol v2.0)
+        # We split commands because asyncpg/Postgres doesn't allow multiple cmds in one prepared statement.
+        ddl_commands = [
+            """
+            CREATE TABLE IF NOT EXISTS signals (
+                id SERIAL PRIMARY KEY,
+                signal_id TEXT UNIQUE,
+                symbol TEXT,
+                state TEXT,
+                exit_price DOUBLE PRECISION,
+                exit_vpin DOUBLE PRECISION,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS outbox_events (
+                id SERIAL PRIMARY KEY,
+                payload TEXT,
+                status TEXT DEFAULT 'PENDING',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                execute_after TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                retry_count INTEGER DEFAULT 0
+            );
+            """,
+            """
+            ALTER TABLE outbox_events 
+            ADD COLUMN IF NOT EXISTS execute_after TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_outbox_events_pending 
+            ON outbox_events (execute_after ASC) 
+            WHERE status = 'PENDING';
+            """,
+            """
+            ALTER TABLE outbox_events SET (
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 50,
+                autovacuum_analyze_scale_factor = 0.0,
+                autovacuum_analyze_threshold = 50
+            );
+            """
+        ]
+        
+        try:
+            async with self.engine.begin() as conn:
+                for cmd in ddl_commands:
+                    await conn.execute(text(cmd.strip()))
+            
+            logger.success("✅ [DB] Infrastructure stabilized. Schema & Vacuum tuned.")
+        except Exception as e:
+            logger.error(f"🚨 [DB] Schema initialization failed: {e}")
+            raise
+
+    async def push_query(self, query: str, params: dict = None):
+        """Atomic execution of a query within a transaction."""
+        async with self.engine.begin() as conn:
+            await conn.execute(text(query), params or {})
 
     async def close(self):
         await self.buffer.stop()

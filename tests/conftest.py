@@ -1,17 +1,16 @@
-"""
-Shared fixtures for Gerald-SuperBrain test suite.
-"""
-import sys
-import os
 import pytest
+import asyncio
+import logging
 
-# Add project root and sniper skill to path
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SNIPER_ROOT = os.path.join(PROJECT_ROOT, "skills", "gerald-sniper")
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create an instance of the default event loop for each test case."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
 
-sys.path.insert(0, PROJECT_ROOT)
-sys.path.insert(0, SNIPER_ROOT)
-
-# Ensure .env is loaded for tests
-from dotenv import load_dotenv
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=True)
+@pytest.fixture(autouse=True)
+def silent_logger():
+    """Disable logging during tests to keep output clean."""
+    logging.getLogger("GEKTOR").setLevel(logging.CRITICAL)
+    yield
