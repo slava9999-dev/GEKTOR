@@ -15,7 +15,7 @@ from src.infrastructure.database import DatabaseManager
 from src.domain.entities.events import ExecutionEvent, ConflatedEvent
 
 class TelegramRadarNotifier:
-    """[GEKTOR v2.0] Institutional Telegram Client with PSR Protocol."""
+    """[GEKTOR v2.0] Institutional Telegram Client with PSR Protocol & Self-Healing Bridge."""
     def __init__(self, db_manager: DatabaseManager, bot_token: str, chat_id: str, event_bus: Any = None, proxy_url: Optional[str] = None):
         self.db = db_manager
         self.bot_token = bot_token
@@ -29,6 +29,9 @@ class TelegramRadarNotifier:
         self._live_allowed = asyncio.Event()
         self._live_allowed.set()
         self._is_throttled = False
+        
+        # [NECROMANCER] Self-Healing Bridge State
+        self.is_bridge_alive = False
         
         # Idempotency: 1000 event IDs
         self._sent_cache = deque(maxlen=1000)
@@ -47,22 +50,37 @@ class TelegramRadarNotifier:
         logger.info("📡 [Telegram] Secure tunnel initialized. PSR Protocol ARMED.")
 
     async def _process_worker(self):
-        """[PSR 4.0] Background Egress Worker."""
+        """[PSR 4.1] NECROMANCER: Immortal Egress Worker with Self-Healing Bridge."""
         if self.proxy_url:
             masked_proxy = self.proxy_url.split('@')[-1] if '@' in self.proxy_url else self.proxy_url
             logger.info(f"📡 [Telegram] Worker process started using proxy: {masked_proxy}")
         else:
             logger.warning("📡 [Telegram] Worker process started WITHOUT proxy (Direct connection).")
-            
-        connector = ProxyConnector.from_url(self.proxy_url) if self.proxy_url else None
-        timeout = aiohttp.ClientTimeout(total=20)
+
+        backoff_sec = 1.0
         
-        try:
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # [OUTER LOOP: IMMORTAL NECROMANCER]
+        # This loop NEVER exits while self._running is True.
+        # If the inner session dies (VPN crash, proxy timeout, aiohttp explosion),
+        # we catch the corpse, sleep with exponential backoff, and resurrect.
+        while self._running:
+            session = None
+            try:
+                connector = ProxyConnector.from_url(self.proxy_url) if self.proxy_url else None
+                timeout = aiohttp.ClientTimeout(total=20)
+                session = aiohttp.ClientSession(connector=connector, timeout=timeout)
                 self._session = session
+                
+                # [BRIDGE RECOVERY] If we're coming back from the dead, announce it
+                if not self.is_bridge_alive:
+                    logger.success("🌉 [BRIDGE RECOVERED] Телеграм-мост восстановлен.")
+                self.is_bridge_alive = True
+                backoff_sec = 1.0  # Reset penalty on successful connection
+                
                 logger.debug("📡 [Telegram] Session active. Running recovery...")
                 await self._run_recovery_phase()
                 
+                # [INNER LOOP: HOT DISPATCH]
                 while self._running:
                     try:
                         await asyncio.wait_for(self._wakeup_event.wait(), timeout=10.0)
@@ -102,11 +120,24 @@ class TelegramRadarNotifier:
                                 if self._is_throttled:
                                      break
                     
-                    await asyncio.sleep(1.0) 
-        except Exception as e:
-            logger.opt(exception=True).error(f"☠️ [Telegram] Worker CRASHED: {e}")
-        finally:
-            logger.warning("🔌 [Telegram] Worker stopped.")
+                    await asyncio.sleep(1.0)
+                    
+            except asyncio.CancelledError:
+                logger.warning("🔌 [Telegram] Worker cancelled. Exiting gracefully.")
+                break
+            except Exception as e:
+                # [BRIDGE DEAD] Session exploded. VPN disconnect, proxy failure, etc.
+                self.is_bridge_alive = False
+                self._session = None
+                logger.critical(f"🚨 [!!! BRIDGE DEAD !!!] ТЕЛЕГРАМ-МОСТ УНИЧТОЖЕН: {e}")
+                logger.warning(f"🔄 [BRIDGE REBOOT] Попытка воскрешения через {backoff_sec:.0f}с...")
+                await asyncio.sleep(backoff_sec)
+                backoff_sec = min(backoff_sec * 2, 60.0)  # Cap at 60 seconds
+            finally:
+                if session and not session.closed:
+                    await session.close()
+        
+        logger.warning("🔌 [Telegram] Worker stopped.")
 
     async def _run_recovery_phase(self):
         if not os.path.exists(self.fallback_file) or os.path.getsize(self.fallback_file) == 0:

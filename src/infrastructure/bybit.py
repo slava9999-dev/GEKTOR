@@ -93,19 +93,22 @@ class BybitIngestor:
                 if stale_sec > 60:
                     logger.critical(f"🚨 [Ingestor] PARTIAL BLINDNESS: {symbol} is silent for {stale_sec:.1f}s.")
                     if self.alert_callback:
-                        await self.alert_callback(f"🚨 <b>[PARTIAL BLINDNESS]</b> Инструмент <code>{symbol}</code> застыл. Проверь статус биржи.")
+                        res = self.alert_callback(f"🚨 <b>[PARTIAL BLINDNESS]</b> Инструмент <code>{symbol}</code> застыл. Проверь статус биржи.")
+                        if asyncio.iscoroutine(res): await res
                     self._last_symbol_tick[symbol] = now 
             total_stale = now - self.last_tick_wall
             if total_stale > 90:
                 logger.critical(f"💀 [Ingestor] TOTAL FLATLINE for {total_stale:.1f}s.")
                 if self.alert_callback:
-                    await self.alert_callback(f"💀 <b>[TOTAL FLATLINE] БИРЖА ПОТЕРЯНА.</b>")
+                    res = self.alert_callback(f"💀 <b>[TOTAL FLATLINE] БИРЖА ПОТЕРЯНА.</b>")
+                    if asyncio.iscoroutine(res): await res
             if self.observed_count > 100:
                 parse_rate = self.parsed_count / self.observed_count
                 if parse_rate < 0.5:
                     reason = "LAG" if self.lag_dropped_count > self.parsed_count else "SCHEMA_DRIFT"
                     if self.alert_callback:
-                        await self.alert_callback(f"🚨 <b>[SYSTEM BLINDNESS]</b> Сбой парсинга: {1-parse_rate:.1%}. {reason}")
+                        res = self.alert_callback(f"🚨 <b>[SYSTEM BLINDNESS]</b> Сбой парсинга: {1-parse_rate:.1%}. {reason}")
+                        if asyncio.iscoroutine(res): await res
             self.observed_count = 0
             self.parsed_count = 0
             self.lag_dropped_count = 0
