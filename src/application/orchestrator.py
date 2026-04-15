@@ -1,5 +1,6 @@
 # src/application/orchestrator.py
 import asyncio
+import math
 import time
 import os
 import json
@@ -20,6 +21,7 @@ from src.application.vanguard import VanguardScanner
 from src.application.microstructure import MicrostructureDefender, L2Snapshot, L2Level
 from src.infrastructure.bybit import BybitRestClient
 from src.domain.macro_regime import MacroRegimeFilter
+from src.domain.friction_guard import ExecutionFrictionGuard
 from src.application.sentinel import BlackoutSentinel, FlatlineSentinel
 from src.infrastructure.event_bus import EventBus
 from src.domain.entities.events import ExecutionEvent, ConflatedEvent, StateInvalidationEvent, EuthanasiaEvent
@@ -164,6 +166,7 @@ class GektorOrchestrator:
         # --- PHASE 2 & 5: MACRO REGIME & EXIT PROTOCOL ---
         self.signal_tracker = SignalTracker(self.db, self.tg)
         self.macro_filter = MacroRegimeFilter()
+        self.friction_guard = ExecutionFrictionGuard(taker_fee_bps=6.0, min_alpha_bps=5.0)
         self._macro_alert_sent = False
 
     def _launch_daemon(self, name: str, coro) -> None:
@@ -406,6 +409,20 @@ class GektorOrchestrator:
                     logger.info(f"🤐 [Mute] Signal for {symbol} suppressed due to Macro Panic.")
                     continue
 
+                # [FRICTION GUARD] Peter Brown's Razor: Alpha must exceed transaction costs
+                # Retrieve dynamic_threshold from state for friction calculation
+                sym_state = self.macro_states.get(symbol, {})
+                vpin_k = sym_state.get("vpin_k", 0)
+                vpin_m = sym_state.get("vpin_m", 0.0)
+                vpin_s = sym_state.get("vpin_s", 0.0)
+                vpin_var = vpin_s / (vpin_k - 1) if vpin_k > 1 else 0.0
+                vpin_std = math.sqrt(max(0.0, vpin_var))
+                dyn_thr = max(settings.VPIN_THRESHOLD, vpin_m + 3.0 * vpin_std) if vpin_k > 50 else settings.VPIN_THRESHOLD
+
+                if not self.friction_guard.is_tradable(symbol, vpin, dyn_thr):
+                    logger.info(f"🛡️ [FRICTION] Signal for {symbol} killed by transaction costs.")
+                    continue
+
                 # Авто-мониторинг новой аномалии
                 self.event_bus.publish_fire_and_forget(self.signal_tracker.register_signal(
                     symbol=symbol,
@@ -492,6 +509,9 @@ class GektorOrchestrator:
             best_ask=L2Level(snapshot_data["ask_p"], snapshot_data["ask_v"]),
             exchange_ts=int(snapshot_data["ts"])
         )
+        # [FRICTION GUARD] Feed L1 BBO to FrictionGuard for spread tracking
+        self.friction_guard.update_quote(symbol, snapshot_data["bid_p"], snapshot_data["ask_p"])
+
         # [MICROSTRUCTURE TRIGGER] Получаем результат с учетом гистерезиса
         result = await self.micro_defenders[symbol].ingest_snapshot(snapshot)
         
