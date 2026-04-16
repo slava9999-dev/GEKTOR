@@ -17,55 +17,79 @@ class L2Snapshot:
     exchange_ts: int
 
 
-class AdaptiveOFIFilter:
+class VolatilityAdjustedOFI:
     """
-    [GEKTOR v4.3] Welford Online Z-Score Filter for OFI.
-    
-    Replaces static thresholds with a rolling statistical baseline.
-    Only fires when |OFI Z-Score| > z_threshold, meaning the current OFI
-    is a true statistical outlier relative to recent market noise.
-    
-    Calibration: First `min_samples` snapshots are used to build the baseline.
-    During calibration, ALL impulses are suppressed (no false positives).
-    """
-    __slots__ = ['_k', '_m', '_s', '_min_samples', '_z_threshold']
+    [GEKTOR v4.4] EMA Z-Score Filter with Micro-Noise Guard.
 
-    def __init__(self, min_samples: int = 100, z_threshold: float = 2.5):
-        self._k: int = 0
-        self._m: float = 0.0
-        self._s: float = 0.0
-        self._min_samples = min_samples
+    Replaces cumulative Welford (which turns to concrete after 12h)
+    with Exponential Moving Average that forgets old regime data.
+    alpha=0.05 ≈ effective window of ~40 snapshots (~20 seconds at 2/sec).
+
+    Dual Lock:
+      1. Z-Score > threshold (statistical significance vs recent baseline)
+      2. |OFI| > min_absolute_ofi (physical mass — rejects dust trades)
+    
+    min_absolute_ofi also acts as a variance floor:
+      effective_std = max(ema_std, min_absolute_ofi / z_threshold)
+    This prevents Z-Score explosions when liquidity dries up.
+    """
+    __slots__ = ['alpha', 'ema_mean', 'ema_var', 'min_absolute_ofi',
+                 'count', '_warmup_required', '_z_threshold']
+
+    def __init__(self, alpha: float = 0.05, min_absolute_ofi: float = 500.0, z_threshold: float = 2.5):
+        self.alpha = alpha
+        self.ema_mean: float = 0.0
+        self.ema_var: float = 0.0
+        self.min_absolute_ofi = min_absolute_ofi
         self._z_threshold = z_threshold
+        self.count: int = 0
+        # Warmup: need ~2x the effective window before trusting the EMA
+        self._warmup_required = int(1 / alpha) * 2  # ~40 snapshots
 
     @property
     def is_calibrated(self) -> bool:
-        return self._k >= self._min_samples
+        return self.count >= self._warmup_required
 
-    def ingest(self, ofi: float) -> float:
-        """
-        Updates running stats and returns Z-Score.
-        Returns 0.0 during calibration phase.
-        """
-        self._k += 1
-        old_m = self._m
-        self._m += (ofi - self._m) / self._k
-        self._s += (ofi - old_m) * (ofi - self._m)
+    def reset_state(self) -> None:
+        """Immediate state annihilation. Called on GAP DETECTED."""
+        self.ema_mean = 0.0
+        self.ema_var = 0.0
+        self.count = 0
 
+    def is_true_anomaly(self, current_ofi: float) -> bool:
+        """
+        Updates EMA stats and returns True only if the OFI is BOTH:
+        - A statistical outlier (Z-Score > threshold)
+        - Physically significant (|OFI| > min_absolute_ofi)
+        """
+        if self.count == 0:
+            self.ema_mean = current_ofi
+            self.ema_var = 0.0
+            self.count += 1
+            return False
+
+        # EMA update (exponential decay — forgets old regimes)
+        delta = current_ofi - self.ema_mean
+        self.ema_mean += self.alpha * delta
+        self.ema_var = (1 - self.alpha) * (self.ema_var + self.alpha * delta ** 2)
+        self.count += 1
+
+        # Block during warmup UNLESS it's an undeniable, massive institutional strike (> 5x absolute noise floor)
+        # This answers the GAP paradox: we capture Godzilla-tier Alpha even while mathematically blind.
         if not self.is_calibrated:
-            return 0.0
+            if abs(current_ofi) > self.min_absolute_ofi * 5.0:
+                logger.warning(f"🦍 [GODZILLA BYPASS] Massive OFI ({current_ofi:.2f}) pierced the calibration matrix!")
+                return True
+            return False
 
-        variance = self._s / (self._k - 1) if self._k > 1 else 0.0
-        std = math.sqrt(max(0.0, variance))
+        # Variance floor: prevents Z-Score explosion on dry liquidity
+        std = math.sqrt(max(0.0, self.ema_var))
+        effective_std = max(std, self.min_absolute_ofi / self._z_threshold)
 
-        if std < 1e-9:
-            return 0.0
+        z_score = abs(current_ofi - self.ema_mean) / effective_std
 
-        return (ofi - self._m) / std
-
-    def is_true_anomaly(self, ofi: float) -> bool:
-        """Returns True only if OFI is a statistically significant outlier."""
-        z = self.ingest(ofi)
-        return abs(z) >= self._z_threshold
+        # DUAL LOCK: statistical outlier AND physical mass
+        return (z_score > self._z_threshold) and (abs(current_ofi) > self.min_absolute_ofi)
 
 
 class MicrostructureDefender:
@@ -97,8 +121,21 @@ class MicrostructureDefender:
         # [HYSTERESIS STATE MACHINE]
         self._current_state: str = "NEUTRAL" # NEUTRAL, ACCUMULATION, DISTRIBUTION
 
-        # [ADAPTIVE Z-SCORE FILTER] Welford-based noise suppressor
-        self._z_filter = AdaptiveOFIFilter(min_samples=100, z_threshold=2.5)
+        # [ADAPTIVE Z-SCORE FILTER] EMA-based noise suppressor
+        self._z_filter = VolatilityAdjustedOFI(
+            alpha=0.05,
+            min_absolute_ofi=self._confirmed_threshold,
+            z_threshold=2.5
+        )
+
+    def reset_state(self) -> None:
+        """[GAP DETECTED] Immediate state annihilation. Forgets all previous microstructural context."""
+        logger.warning(f"🧹 [MICROSTRUCTURE] Gap detected. Erasing memory for {self.symbol}.")
+        self._prev_snapshot = None
+        self._accumulated_ofi = 0.0
+        self._current_state = "NEUTRAL"
+        self._execution_buffer = 0.0
+        self._z_filter.reset_state()
 
     def update_execution(self, volume: float, side: str):
         """Updates the trade volume delta since the last L2 snapshot."""

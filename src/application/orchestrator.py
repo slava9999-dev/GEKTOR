@@ -284,6 +284,11 @@ class GektorOrchestrator:
         
         # 1. Immediate Causality Lock
         self.quarantine.mark_corrupted(symbol)
+        
+        # [MICROSTRUCTURE AMNESIA] Erase micro-state completely to avoid trading on disjointed ticks
+        if symbol in self.micro_defenders:
+            self.micro_defenders[symbol].reset_state()
+            
         if symbol in self.batchers:
             await self.batchers[symbol].flush_pending_ticks()
             
@@ -517,13 +522,6 @@ class GektorOrchestrator:
         
         # [КРИТИЧЕСКИЙ БАРЬЕР] Посылаем сигнал в ТГ только в момент СТАРТА импульса (фронт)
         if result.get("is_new_impulse"):
-            # [CALIBRATION GATE] Block OFI alerts until MathCore is fully warmed up.
-            # Sending signals when VPIN is at CALIB: 18/50 is trading blind.
-            sym_state = self.macro_states.get(symbol, {})
-            if sym_state.get("state") == "WARMUP":
-                logger.debug(f"🤐 [CALIBRATION] OFI impulse suppressed for {symbol} (MathCore still in WARMUP).")
-                return
-
             # [COOLDOWN CHECK] Проверяем таймаут для микроструктурных импульсов
             last_time = self._last_alert_time.get(symbol, 0)
             if time.time() - last_time < 3600:

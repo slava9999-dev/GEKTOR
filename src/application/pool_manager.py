@@ -64,8 +64,8 @@ class WorkerDispatchController:
         return old_core, old_noise
 
     def shutdown(self):
-        self._core_pool.shutdown(wait=False, cancel_futures=True)
-        self._noise_pool.shutdown(wait=False, cancel_futures=True)
+        self._core_pool.shutdown(wait=True)
+        self._noise_pool.shutdown(wait=True)
 
 
 class WorkerPoolManager:
