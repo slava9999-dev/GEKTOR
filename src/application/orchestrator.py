@@ -150,6 +150,7 @@ class GektorOrchestrator:
         
         self.batchers: Dict[str, TickBatcher] = {}
         self.micro_defenders: Dict[str, MicrostructureDefender] = {}
+        self.latest_bbo: Dict[str, Tuple[float, float]] = {}
         
         # [SIGNAL COOLDOWN v4.1] Защита от спама на запилах (3600 сек / 60 мин)
         self._last_alert_time: Dict[str, float] = {}
@@ -404,7 +405,8 @@ class GektorOrchestrator:
                     self._macro_alert_sent = False
 
             # Синхронизация VPIN/State в трекере для реактивных правил
-            self.event_bus.publish_fire_and_forget(self.signal_tracker.update_math_state(symbol, vpin, price, ts))
+            bid, ask = self.latest_bbo.get(symbol, (price, price))
+            self.event_bus.publish_fire_and_forget(self.signal_tracker.update_math_state(symbol, vpin, price, ts, bid, ask))
 
             if res.get("is_anomaly"):
                 # [COOLDOWN CHECK] Проверяем таймаут 60 минут
@@ -432,13 +434,15 @@ class GektorOrchestrator:
                     logger.info(f"🛡️ [FRICTION] Signal for {symbol} killed by transaction costs.")
                     continue
 
-                # Авто-мониторинг новой аномалии
+                # Авто-мониторинг новой аномалии с учетом L1 спреда
                 self.event_bus.publish_fire_and_forget(self.signal_tracker.register_signal(
                     symbol=symbol,
                     price=price,
                     vpin=vpin,
                     direction=1,
-                    timestamp=ts
+                    timestamp=ts,
+                    entry_bid=bid,
+                    entry_ask=ask
                 ))
                 
                 self._last_alert_time[symbol] = time.time()
@@ -518,6 +522,7 @@ class GektorOrchestrator:
             best_ask=L2Level(snapshot_data["ask_p"], snapshot_data["ask_v"]),
             exchange_ts=int(snapshot_data["ts"])
         )
+        self.latest_bbo[symbol] = (snapshot.best_bid.price, snapshot.best_ask.price)
         # [FRICTION GUARD] Feed L1 BBO to FrictionGuard for spread tracking
         self.friction_guard.update_quote(symbol, snapshot_data["bid_p"], snapshot_data["ask_p"])
 
@@ -544,6 +549,19 @@ class GektorOrchestrator:
             return
 
         self._last_alert_time[symbol] = time.time()
+        
+        # [SHADOW REGISTRATION] Оповещаем трекер о новом импульсе
+        direction = 1 if result["state"] == "BUY_IMPULSE" else -1
+        self.event_bus.publish_fire_and_forget(self.signal_tracker.register_signal(
+            symbol=symbol,
+            price=snapshot.best_bid.price,
+            vpin=0.0,
+            direction=direction,
+            timestamp=snapshot.exchange_ts,
+            entry_bid=snapshot.best_bid.price,
+            entry_ask=snapshot.best_ask.price
+        ))
+
         self.tg.notify_event({
             "type": "MICRO_IMPULSE",
             "symbol": symbol,

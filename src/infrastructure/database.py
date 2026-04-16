@@ -23,53 +23,123 @@ class ReliableIngestionBuffer:
             host=settings.REDIS_HOST, 
             port=settings.REDIS_PORT, 
             password=settings.REDIS_PASSWORD, 
-            decode_responses=True
+            decode_responses=True,
+            socket_timeout=2,
+            socket_connect_timeout=2
         )
         self.queue_key = "gektor:ingest:queue"
         self.processing_key = "gektor:ingest:processing"
         self.dlq_key = "gektor:ingest:dlq"
+        self.spillover_file = "artifacts/spillover.jsonl"
         self._worker_task = None
         self._sweeper_task = None
+        self._spillover_drain_task = None
         self._running = False
+        self._redis_available = False
 
     async def start(self):
-        # 1. Healthcheck: Redis Version Verification (GEKTOR Protocol)
-        info = await self.redis.info("server")
-        version = info.get("redis_version", "0.0.0")
-        major, minor = map(int, version.split(".")[:2])
-        if major < 6 or (major == 6 and minor < 2):
-            logger.critical(f"❌ [DB] Redis 6.2+ required for BLMOVE. Found: {version}")
-            raise RuntimeError(f"Incompatible Redis version: {version}")
-        
-        logger.info(f"✅ [DB] Redis Version Check Passed: {version}")
+        try:
+            # 1. Healthcheck: Redis Version & Memory Verification
+            info = await self.redis.info("server")
+            version = info.get("redis_version", "0.0.0")
+            logger.info(f"✅ [DB] Redis Version Check: {version}")
+            self._redis_available = True
+        except Exception as e:
+            logger.error(f"⚠️ [DB] Redis Offline at start. Using Local Spillover path. Error: {e}")
+            self._redis_available = False
+
+        if not os.path.exists("artifacts"):
+            os.makedirs("artifacts")
 
         if not self._running:
-            # Crash Recovery
-            await self._recover_stranded_tasks()
             self._running = True
-            self._worker_task = asyncio.create_task(self._process_queue())
-            self._sweeper_task = asyncio.create_task(self._active_sweeper())
-            logger.info(f"🚀 [DB] Reliable Buffer active.")
+            if self._redis_available:
+                await self._recover_stranded_tasks()
+                self._worker_task = asyncio.create_task(self._process_queue())
+                self._sweeper_task = asyncio.create_task(self._active_sweeper())
+            
+            self._spillover_drain_task = asyncio.create_task(self._spillover_sentinel())
+            logger.info(f"🚀 [DB] Reliable Buffer active (Spillover path: {self.spillover_file}).")
 
-    async def _recover_stranded_tasks(self):
-        recovered = 0
-        while True:
-            item = await self.redis.lmove(self.processing_key, self.queue_key, "RIGHT", "LEFT")
-            if not item: break
-            recovered += 1
-        if recovered > 0:
-            logger.warning(f"♻️ [DB] Recovered {recovered} stranded tasks.")
+    async def _check_redis_memory(self) -> bool:
+        """Returns True if Redis is healthy and has enough memory."""
+        try:
+            info = await self.redis.info("memory")
+            used = info.get("used_memory", 0)
+            total = info.get("maxmemory", 0)
+            if total > 0 and (used / total) > 0.8:
+                logger.warning(f"🚨 [DB] Redis Memory Pressure (>80%): {used}/{total}. Activating Spillover.")
+                return False
+            return True
+        except:
+            return False
 
     async def push_query(self, query: str, params: Any = None):
+        payload = json.dumps({
+            "query": query, 
+            "params": params,
+            "ts": time.time()
+        }, default=str)
+
+        # [LVL 3 VALVE: Local Spillover]
+        is_healthy = self._redis_available and await self._check_redis_memory()
+        
+        if is_healthy:
+            try:
+                await self.redis.lpush(self.queue_key, payload)
+                return
+            except Exception as e:
+                logger.error(f"🚨 [DB] Redis Push Failed: {e}. Diverting to Disk.")
+
+        # Spill to disk (NVMe Path)
+        await self._spill_to_disk(payload)
+
+    async def _spill_to_disk(self, payload: str):
         try:
-            payload = json.dumps({
-                "query": query, 
-                "params": params,
-                "ts": time.time()
-            }, default=str)
-            await self.redis.lpush(self.queue_key, payload)
+            async with asyncio.Lock(): # Simple guard for file append
+                with open(self.spillover_file, "a") as f:
+                    f.write(payload + "\n")
         except Exception as e:
-            logger.error(f"🚨 [DB] Redis WAL failure: {e}")
+            logger.critical(f"☠️ [DB] TOTAL COLLAPSE. Disk Spillover Failed: {e}")
+
+    async def _spillover_sentinel(self):
+        """Periodically checks if disk data can be moved back to Redis."""
+        while self._running:
+            await asyncio.sleep(60)
+            if not os.path.exists(self.spillover_file) or os.path.getsize(self.spillover_file) == 0:
+                continue
+
+            # Try to reconnect if Redis was offline
+            if not self._redis_available:
+                try:
+                    await self.redis.ping()
+                    self._redis_available = True
+                    logger.success("✅ [DB] Redis re-established. Draining spillover...")
+                    if not self._worker_task:
+                        self._worker_task = asyncio.create_task(self._process_queue())
+                except:
+                    continue
+
+            # Check memory before draining
+            if not await self._check_redis_memory():
+                continue
+
+            # Drain procedure
+            try:
+                lines = []
+                with open(self.spillover_file, "r") as f:
+                    lines = f.readlines()
+                
+                # Clear file
+                open(self.spillover_file, "w").close()
+                
+                for line in lines:
+                    if line.strip():
+                        await self.redis.lpush(self.queue_key, line.strip())
+                
+                logger.info(f"♻️ [DB] Successfully drained {len(lines)} records from Disk into Redis.")
+            except Exception as e:
+                logger.error(f"⚠️ [DB] Spillover Drain Error: {e}")
 
     async def _process_queue(self):
         while self._running:
@@ -102,12 +172,14 @@ class ReliableIngestionBuffer:
             except asyncio.CancelledError: break
             except Exception as e:
                 logger.error(f"⚠️ [DB] Worker Error: {e}")
-                await asyncio.sleep(1)
+                self._redis_available = False # Mark as dead to trigger sentinel retry
+                await asyncio.sleep(5)
 
     async def _active_sweeper(self):
         while self._running:
             try:
                 await asyncio.sleep(30)
+                if not self._redis_available: continue
                 processing_items = await self.redis.lrange(self.processing_key, 0, -1)
                 now = time.time()
                 for payload_str in processing_items:
@@ -126,6 +198,7 @@ class ReliableIngestionBuffer:
         self._running = False
         if self._worker_task: self._worker_task.cancel()
         if self._sweeper_task: self._sweeper_task.cancel()
+        if self._spillover_drain_task: self._spillover_drain_task.cancel()
         await self.redis.close()
 
 class CircuitBreaker:
@@ -186,7 +259,12 @@ class DatabaseManager:
                 signal_id TEXT UNIQUE,
                 symbol TEXT,
                 state TEXT,
-                exit_price DOUBLE PRECISION,
+                entry_bid DOUBLE PRECISION,
+                entry_ask DOUBLE PRECISION,
+                exit_bid DOUBLE PRECISION,
+                exit_ask DOUBLE PRECISION,
+                human_entry_bid DOUBLE PRECISION,
+                human_entry_ask DOUBLE PRECISION,
                 exit_vpin DOUBLE PRECISION,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );

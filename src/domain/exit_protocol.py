@@ -20,16 +20,63 @@ class MarketTick:
     exchange_ts: int  # ms
     conflated: bool = False
 
+@dataclass(slots=True, frozen=True)
+class MarketSnapshot:
+    bid_price: float
+    ask_price: float
+    mid_price: float
+    timestamp: float
+
 @dataclass(slots=True)
 class ActiveSignal:
     signal_id: str
     symbol: str
     entry_ts: int
-    entry_price: float
+    entry_price: float # Keep for legacy, but we use bid/ask for real analysis
+    entry_bid: float
+    entry_ask: float
     direction: int  # 1 for Long, -1 for Short
+    
+    # [LATENCY GUARD] Snapshot at t+1200ms to verify "Human Alpha"
+    human_entry_bid: float = 0.0
+    human_entry_ask: float = 0.0
+    
     state: SignalState = SignalState.ACTIVE
     bars_observed: int = 0
     max_vpin: float = 0.0
+
+class ExecutionSimulator:
+    """
+    [ФАЗА 6: АНТИ-ИЛЛЮЗИЯ PnL]
+    Вычисление реального маркаута с учетом спреда и издержек.
+    """
+    def __init__(self, taker_fee_bps: float = 4.0):
+        self.taker_fee_bps = taker_fee_bps
+
+    def calculate_real_markout_bps(self, 
+                                   direction: int, 
+                                   entry_bid: float,
+                                   entry_ask: float,
+                                   exit_bid: float,
+                                   exit_ask: float) -> float:
+        """
+        LONG: Enter @ Ask, Exit @ Bid.
+        SHORT: Enter @ Bid, Exit @ Ask.
+        """
+        if direction > 0: # BUY
+            # Real execution crosses the spread
+            entry_price = entry_ask
+            exit_price = exit_bid
+        else: # SELL
+            entry_price = entry_bid
+            exit_price = exit_ask
+
+        if entry_price == 0: return 0.0
+        
+        gross_pnl_bps = ((exit_price - entry_price) / entry_price) * 10000 * (1 if direction > 0 else -1)
+        # Round-trip fee
+        net_pnl_bps = gross_pnl_bps - (self.taker_fee_bps * 2)
+        return net_pnl_bps
 
 class InvalidationRule(Protocol):
     def check(self, signal: ActiveSignal, tick: MarketTick, current_vpin: float) -> Optional[SignalState]:
