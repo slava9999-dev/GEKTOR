@@ -19,77 +19,59 @@ class L2Snapshot:
 
 class VolatilityAdjustedOFI:
     """
-    [GEKTOR v4.4] EMA Z-Score Filter with Micro-Noise Guard.
-
-    Replaces cumulative Welford (which turns to concrete after 12h)
-    with Exponential Moving Average that forgets old regime data.
-    alpha=0.05 ≈ effective window of ~40 snapshots (~20 seconds at 2/sec).
-
-    Dual Lock:
-      1. Z-Score > threshold (statistical significance vs recent baseline)
-      2. |OFI| > min_absolute_ofi (physical mass — rejects dust trades)
-    
-    min_absolute_ofi also acts as a variance floor:
-      effective_std = max(ema_std, min_absolute_ofi / z_threshold)
-    This prevents Z-Score explosions when liquidity dries up.
+    [GEKTOR v4.4] EMA Z-Score Filter with USD-based Godzilla Bypass.
     """
-    __slots__ = ['alpha', 'ema_mean', 'ema_var', 'min_absolute_ofi',
-                 'count', '_warmup_required', '_z_threshold']
+    __slots__ = ['symbol', 'alpha', 'ema_mean', 'ema_var', 'min_absolute_ofi',
+                 'godzilla_usd_threshold', 'count', '_warmup_required', '_z_threshold']
 
-    def __init__(self, alpha: float = 0.05, min_absolute_ofi: float = 500.0, z_threshold: float = 2.5):
+    def __init__(self, symbol: str, alpha: float = 0.05, min_absolute_ofi: float = 500.0, 
+                 godzilla_usd_threshold: float = 100000.0, z_threshold: float = 2.5):
+        self.symbol = symbol
         self.alpha = alpha
         self.ema_mean: float = 0.0
         self.ema_var: float = 0.0
         self.min_absolute_ofi = min_absolute_ofi
+        self.godzilla_usd_threshold = godzilla_usd_threshold
         self._z_threshold = z_threshold
         self.count: int = 0
-        # Warmup: need ~2x the effective window before trusting the EMA
-        self._warmup_required = int(1 / alpha) * 2  # ~40 snapshots
+        self._warmup_required = int(1 / alpha) * 2
 
     @property
     def is_calibrated(self) -> bool:
         return self.count >= self._warmup_required
 
     def reset_state(self) -> None:
-        """Immediate state annihilation. Called on GAP DETECTED."""
         self.ema_mean = 0.0
         self.ema_var = 0.0
         self.count = 0
 
-    def is_true_anomaly(self, current_ofi: float) -> bool:
-        """
-        Updates EMA stats and returns True only if the OFI is BOTH:
-        - A statistical outlier (Z-Score > threshold)
-        - Physically significant (|OFI| > min_absolute_ofi)
-        """
-        if self.count == 0:
-            self.ema_mean = current_ofi
-            self.ema_var = 0.0
-            self.count += 1
-            return False
-
-        # EMA update (exponential decay — forgets old regimes)
-        delta = current_ofi - self.ema_mean
-        self.ema_mean += self.alpha * delta
-        self.ema_var = (1 - self.alpha) * (self.ema_var + self.alpha * delta ** 2)
-        self.count += 1
-
-        # Block during warmup UNLESS it's an undeniable, massive institutional strike (> 5x absolute noise floor)
-        # This answers the GAP paradox: we capture Godzilla-tier Alpha even while mathematically blind.
-        if not self.is_calibrated:
-            if abs(current_ofi) > self.min_absolute_ofi * 5.0:
-                logger.warning(f"🦍 [GODZILLA BYPASS] Massive OFI ({current_ofi:.2f}) pierced the calibration matrix!")
+    def is_true_anomaly(self, current_ofi: float, current_price: float) -> bool:
+        ofi_usd_value = abs(current_ofi * current_price)
+        
+        if self.count < self._warmup_required:
+            if ofi_usd_value > self.godzilla_usd_threshold:
+                logger.warning(f"🦍 [GODZILLA BYPASS] {self.symbol} | Массивный удар: ${ofi_usd_value:,.2f} | Пробитие матрицы калибровки!")
                 return True
+            self._update_ema(current_ofi)
             return False
 
-        # Variance floor: prevents Z-Score explosion on dry liquidity
+        self._update_ema(current_ofi)
+
         std = math.sqrt(max(0.0, self.ema_var))
         effective_std = max(std, self.min_absolute_ofi / self._z_threshold)
-
         z_score = abs(current_ofi - self.ema_mean) / effective_std
 
-        # DUAL LOCK: statistical outlier AND physical mass
         return (z_score > self._z_threshold) and (abs(current_ofi) > self.min_absolute_ofi)
+
+    def _update_ema(self, current_ofi: float):
+        if self.count == 0:
+            self.ema_mean = current_ofi
+            self.count += 1
+            return
+        delta = current_ofi - self.ema_mean
+        self.ema_mean += self.alpha * delta
+        self.ema_var = (1 - self.alpha) * (self.ema_var + self.alpha * delta**2)
+        self.count += 1
 
 
 class MicrostructureDefender:
@@ -114,6 +96,7 @@ class MicrostructureDefender:
         self._confirmed_threshold = confirmed_threshold or config["threshold"]
         factor = release_factor or config["factor"]
         self._release_threshold = self._confirmed_threshold * factor
+        godzilla_thr = config.get("godzilla", 1000000.0 if is_major else 100000.0)
         
         # Tracks realized trade volume between snapshots
         self._execution_buffer: float = 0.0 
@@ -123,8 +106,10 @@ class MicrostructureDefender:
 
         # [ADAPTIVE Z-SCORE FILTER] EMA-based noise suppressor
         self._z_filter = VolatilityAdjustedOFI(
+            symbol=self.symbol,
             alpha=0.05,
             min_absolute_ofi=self._confirmed_threshold,
+            godzilla_usd_threshold=godzilla_thr,
             z_threshold=2.5
         )
 
@@ -139,17 +124,12 @@ class MicrostructureDefender:
 
     def update_execution(self, volume: float, side: str):
         """Updates the trade volume delta since the last L2 snapshot."""
-        # Simple net volume: Buy (+) / Sell (-)
         if side.upper() == 'BUY':
             self._execution_buffer += volume
         else:
             self._execution_buffer -= volume
 
     def calculate_informed_ofi(self, current: L2Snapshot) -> float:
-        """
-        Calculates OFI with Trade-Delta Convergence.
-        Prevents being trapped by HFT spoofers (Phantom Liquidity).
-        """
         if not self._prev_snapshot:
             self._prev_snapshot = current
             return 0.0
@@ -157,7 +137,6 @@ class MicrostructureDefender:
         p_bid, p_ask = self._prev_snapshot.best_bid, self._prev_snapshot.best_ask
         c_bid, c_ask = current.best_bid, current.best_ask
 
-        # 1. Raw OFI Calculation (Cont et al, 2014)
         ofi_bid = 0.0
         if c_bid.price >= p_bid.price: ofi_bid += c_bid.volume
         if c_bid.price <= p_bid.price: ofi_bid -= p_bid.volume
@@ -168,18 +147,15 @@ class MicrostructureDefender:
 
         raw_ofi = ofi_bid - ofi_ask
         
-        # 2. [PHANTOM FILTER] Check convergence with realized Trade Delta
         confirmed_ofi = raw_ofi
-        if raw_ofi > 0: # Bullish Imbalance
+        if raw_ofi > 0:
             confirmed_ofi = min(raw_ofi, max(self._execution_buffer, 0) * 1.5)
-        elif raw_ofi < 0: # Bearish Imbalance
+        elif raw_ofi < 0:
             confirmed_ofi = max(raw_ofi, min(self._execution_buffer, 0) * 1.5)
 
-        # 3. Update state
         self._prev_snapshot = current
-        self._execution_buffer = 0.0 # Reset for next window
+        self._execution_buffer = 0.0
         
-        # EWMA for noise reduction
         self._accumulated_ofi = (confirmed_ofi * 0.2) + (self._accumulated_ofi * 0.8)
         return self._accumulated_ofi
 
@@ -189,10 +165,9 @@ class MicrostructureDefender:
         is_new_impulse = False
         prev_state = self._current_state
 
-        # [GATE 0: ADAPTIVE Z-SCORE] Feed OFI into Welford filter.
-        # During calibration (first 100 snapshots), z_is_anomaly is always False.
-        # After calibration, only statistically significant OFI deviations pass.
-        z_is_anomaly = self._z_filter.is_true_anomaly(ofi)
+        # [GATE 0: ADAPTIVE Z-SCORE] Feed OFI into EMA filter.
+        # Uses current best bid price to calculate USD threshold for Godzilla bypass.
+        z_is_anomaly = self._z_filter.is_true_anomaly(ofi, snapshot.best_bid.price)
 
         # [HYSTERESIS STATE MACHINE] — transitions require Z-Score confirmation
         if self._current_state == "NEUTRAL":

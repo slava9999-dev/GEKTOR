@@ -602,7 +602,17 @@ class GektorOrchestrator:
         tasks = [b.flush_pending_ticks() for b in self.batchers.values()]
         if tasks:
             await asyncio.gather(*tasks)
-        self.pool_manager.shutdown_all()
+        # [ИДЕМПОТЕНТНЫЙ ASYNC SHUTDOWN] 
+        # Блокирующее ожидание пула вынесено в отдельный поток, чтобы Event Loop жил
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self.pool_manager.shutdown_all),
+                timeout=10.0
+            )
+            logger.info("✅ [SHUTDOWN] Воркеры успешно завершили Liquidity Harvest.")
+        except asyncio.TimeoutError:
+            logger.error("🚨 [SHUTDOWN] Таймаут пула (10s). Принудительный аборт (ОС убьет пул).")
         await self.db.close()
         await self.tg.stop()
         logger.info("💤 [CORE] Offline.")
