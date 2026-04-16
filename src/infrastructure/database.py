@@ -128,15 +128,44 @@ class ReliableIngestionBuffer:
         if self._sweeper_task: self._sweeper_task.cancel()
         await self.redis.close()
 
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 30):
+        self.failure_count = 0
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.last_failure_time = 0
+        self.state = "CLOSED" # CLOSED, OPEN, HALF_OPEN
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "OPEN"
+            logger.critical("🚨 [CIRCUIT BREAKER] Database connection is OPEN (Failing Fast).")
+
+    def record_success(self):
+        self.failure_count = 0
+        self.state = "CLOSED"
+
+    @property
+    def is_available(self) -> bool:
+        if self.state == "OPEN":
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = "HALF_OPEN"
+                return True
+            return False
+        return True
+
 class DatabaseManager:
-    """SQLAlchemy 2.0 + asyncpg Database Manager."""
+    """SQLAlchemy 2.0 + asyncpg Database Manager with Circuit Breaker."""
     def __init__(self):
         self.engine = create_async_engine(
             settings.ASYNC_DATABASE_URL,
             pool_size=50,
             max_overflow=20,
             pool_recycle=300,
-            pool_pre_ping=True
+            pool_pre_ping=True,
+            connect_args={"command_timeout": 5} # Fast failure at TCP level
         )
         self.SessionLocal = async_sessionmaker(
             bind=self.engine,
@@ -145,12 +174,11 @@ class DatabaseManager:
             autoflush=False
         )
         self.buffer = ReliableIngestionBuffer(self)
+        self.cb = CircuitBreaker()
 
     async def initialize(self):
         await self.buffer.start()
         
-        # Schema Initialization (GEKTOR Protocol v2.0)
-        # We split commands because asyncpg/Postgres doesn't allow multiple cmds in one prepared statement.
         ddl_commands = [
             """
             CREATE TABLE IF NOT EXISTS signals (
@@ -172,23 +200,6 @@ class DatabaseManager:
                 execute_after TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 retry_count INTEGER DEFAULT 0
             );
-            """,
-            """
-            ALTER TABLE outbox_events 
-            ADD COLUMN IF NOT EXISTS execute_after TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_outbox_events_pending 
-            ON outbox_events (execute_after ASC) 
-            WHERE status = 'PENDING';
-            """,
-            """
-            ALTER TABLE outbox_events SET (
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 50,
-                autovacuum_analyze_scale_factor = 0.0,
-                autovacuum_analyze_threshold = 50
-            );
             """
         ]
         
@@ -196,16 +207,27 @@ class DatabaseManager:
             async with self.engine.begin() as conn:
                 for cmd in ddl_commands:
                     await conn.execute(text(cmd.strip()))
-            
-            logger.success("✅ [DB] Infrastructure stabilized. Schema & Vacuum tuned.")
+            logger.success("✅ [DB] Infrastructure stabilized.")
         except Exception as e:
             logger.error(f"🚨 [DB] Schema initialization failed: {e}")
             raise
 
-    async def push_query(self, query: str, params: dict = None):
-        """Atomic execution of a query within a transaction."""
-        async with self.engine.begin() as conn:
-            await conn.execute(text(query), params or {})
+    async def push_query_to_wal(self, query: str, params: dict = None):
+        """[NON-BLOCKING] Offloads write to Redis WAL. Zero blocking on event loop."""
+        await self.buffer.push_query(query, params)
+
+    async def execute_with_circuit_breaker(self, query: str, params: dict = None):
+        """[FAIL-FAST] Executes query directly or fails immediately if DB is down."""
+        if not self.cb.is_available:
+            raise RuntimeError("Database Unavailable (Circuit Breaker OPEN)")
+
+        try:
+            async with self.engine.begin() as conn:
+                await conn.execute(text(query), params or {})
+                self.cb.record_success()
+        except Exception as e:
+            self.cb.record_failure()
+            raise
 
     async def close(self):
         await self.buffer.stop()

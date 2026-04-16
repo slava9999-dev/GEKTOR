@@ -293,6 +293,9 @@ class GektorOrchestrator:
         if symbol in self.batchers:
             await self.batchers[symbol].flush_pending_ticks()
             
+        # [ESCROW PURGE] Kill any pending signals waiting in quarantine
+        self.escrow_guard.purge_stale_escrow(symbol)
+            
         asyncio.create_task(self.tg.notify_manual(
             f"☠️ <b>[STATE CORRUPTED: {symbol}]</b>\n"
             f"Причинно-следственная связь разорвана.\n"

@@ -1,6 +1,7 @@
 # src/application/exit_protocol_service.py
 import asyncio
 import json
+import time
 from typing import List, Dict, Optional
 from loguru import logger
 from sqlalchemy import text
@@ -94,9 +95,9 @@ class SignalTracker:
                 await self._persist_all_signals()
 
     async def _trigger_abort(self, signal: ActiveSignal, vpin: float, price: float):
-        """Атомарная фиксация стейта и алерта (Transactional Outbox)."""
-        query = "INSERT INTO signals (signal_id, symbol, state, exit_price, exit_vpin) VALUES (:sid, :symbol, :state, :ep, :ev)"
-        params = {
+        """[NON-BLOCKING] Atomic emission of state and alert via Redis WAL."""
+        signal_query = "INSERT INTO signals (signal_id, symbol, state, exit_price, exit_vpin) VALUES (:sid, :symbol, :state, :ep, :ev)"
+        signal_params = {
             "sid": signal.signal_id,
             "symbol": signal.symbol,
             "state": signal.state.name,
@@ -104,26 +105,24 @@ class SignalTracker:
             "ev": vpin
         }
         
-        # Format payload for Telegram (same as how TelegramRadarNotifier formats it, roughly based on event_data)
+        # 1. Push Signal Record to WAL (Redis)
+        await self.db.push_query_to_wal(signal_query, signal_params)
+
+        # 2. Push Alert to Outbox via WAL (Redis)
         event_dict = {
             "symbol": signal.symbol,
             "price": price,
             "vpin": vpin,
-            "timestamp": int(asyncio.get_event_loop().time() * 1000), 
+            "timestamp": int(time.time() * 1000), 
             "abort_mission": True,
             "abort_reason": signal.state.name
         }
         tg_payload = self.tg._format_message(event_dict)
         
-        async with self.db.SessionLocal() as session:
-            try:
-                await session.execute(text(query), params)
-                await self.outbox_repo.save_alert_atomically(tg_payload, session)
-                await session.commit()
-                logger.warning(f"🚨 [ExitProtocol] PREMISE INVALIDATED: {signal.symbol} -> {signal.state.name}")
-            except Exception as e:
-                await session.rollback()
-                logger.error(f"❌ [ExitProtocol] Transaction Failed for {signal.symbol}: {e}")
+        outbox_query = "INSERT INTO outbox_events (payload) VALUES (:payload)"
+        await self.db.push_query_to_wal(outbox_query, {"payload": tg_payload})
+
+        logger.warning(f"🚨 [ExitProtocol] PREMISE INVALIDATED (Pushed to WAL): {signal.symbol} -> {signal.state.name}")
 
     async def _persist_all_signals(self):
         """Dump active signals to Redis for survival."""

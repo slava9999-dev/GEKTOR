@@ -1,7 +1,7 @@
 import math
 from loguru import logger
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from src.infrastructure.config import settings
 
 @dataclass(slots=True, frozen=True)
@@ -129,10 +129,34 @@ class MicrostructureDefender:
         else:
             self._execution_buffer -= volume
 
-    def calculate_informed_ofi(self, current: L2Snapshot) -> float:
+    def classify_regime(self, raw_ofi: float, trade_imbalance: float) -> str:
+        """
+        [GEKTOR v4.5] Order Flow Toxicity Matrix.
+        Classifies microstructure without data destruction.
+        """
+        # [SPOOFING] Huge book movement, but zero trade volume (HFT Ghosting)
+        if abs(raw_ofi) > self._confirmed_threshold and abs(trade_imbalance) < (self._confirmed_threshold * 0.1):
+            return "SPOOF_GHOST"
+        
+        # [PASSIVE ABSORPTION] Book replenishing while being hit by opposite market orders (Iceberg)
+        if (raw_ofi > 0 and trade_imbalance < 0):
+            return "PASSIVE_ABSORPTION_BUY"
+        if (raw_ofi < 0 and trade_imbalance > 0):
+            return "PASSIVE_ABSORPTION_SELL"
+            
+        # [AGGRESSIVE SWEEP] Book flow and market orders moving in sync (Momentum)
+        if (raw_ofi > 0 and trade_imbalance > 0):
+            return "AGGRESSIVE_SWEEP_BUY"
+        if (raw_ofi < 0 and trade_imbalance < 0):
+            return "AGGRESSIVE_SWEEP_SELL"
+            
+        return "NOISE"
+
+    def calculate_informed_ofi(self, current: L2Snapshot) -> Tuple[float, float]:
+        """Returns (raw_ofi, trade_imbalance)"""
         if not self._prev_snapshot:
             self._prev_snapshot = current
-            return 0.0
+            return 0.0, 0.0
 
         p_bid, p_ask = self._prev_snapshot.best_bid, self._prev_snapshot.best_ask
         c_bid, c_ask = current.best_bid, current.best_ask
@@ -146,27 +170,30 @@ class MicrostructureDefender:
         if c_ask.price >= p_ask.price: ofi_ask -= p_ask.volume
 
         raw_ofi = ofi_bid - ofi_ask
-        
-        confirmed_ofi = raw_ofi
-        if raw_ofi > 0:
-            confirmed_ofi = min(raw_ofi, max(self._execution_buffer, 0) * 1.5)
-        elif raw_ofi < 0:
-            confirmed_ofi = max(raw_ofi, min(self._execution_buffer, 0) * 1.5)
+        trade_imbalance = self._execution_buffer
 
         self._prev_snapshot = current
         self._execution_buffer = 0.0
         
-        self._accumulated_ofi = (confirmed_ofi * 0.2) + (self._accumulated_ofi * 0.8)
-        return self._accumulated_ofi
+        return raw_ofi, trade_imbalance
 
     async def ingest_snapshot(self, snapshot: L2Snapshot) -> dict:
-        """Entry point for the Event Bus with Adaptive Z-Score + Hysteresis Shield."""
-        ofi = self.calculate_informed_ofi(snapshot)
+        """Entry point for the Event Bus with Toxicity Matrix & Hysteresis."""
+        raw_ofi, tfi = self.calculate_informed_ofi(snapshot)
+        regime = self.classify_regime(raw_ofi, tfi)
+        
+        # [PHANTOM FILTER] Ghost orders are ignored.
+        if regime == "SPOOF_GHOST":
+            return {"state": "NEUTRAL", "ofi": 0.0, "is_new_impulse": False}
+
+        # EWMA for noise reduction (EWMA on the signal we actually use)
+        self._accumulated_ofi = (raw_ofi * 0.2) + (self._accumulated_ofi * 0.8)
+        ofi = self._accumulated_ofi
+
         is_new_impulse = False
         prev_state = self._current_state
 
-        # [GATE 0: ADAPTIVE Z-SCORE] Feed OFI into EMA filter.
-        # Uses current best bid price to calculate USD threshold for Godzilla bypass.
+        # [GATE 0: ADAPTIVE Z-SCORE]
         z_is_anomaly = self._z_filter.is_true_anomaly(ofi, snapshot.best_bid.price)
 
         # [HYSTERESIS STATE MACHINE] — transitions require Z-Score confirmation
