@@ -26,7 +26,7 @@ from src.application.sentinel import BlackoutSentinel, FlatlineSentinel
 from src.infrastructure.event_bus import EventBus
 from src.domain.entities.events import ExecutionEvent, ConflatedEvent, StateInvalidationEvent, EuthanasiaEvent
 from src.application.quarantine import QuarantineManager
-
+from src.application.escrow import LiquidationEchoGuard
 class TickBatcher:
     """[GEKTOR v2.0] IPC Optimization with Memory Cycle Management."""
     def __init__(self, symbol: str, pool_manager: WorkerPoolManager, on_results_callback):
@@ -118,6 +118,7 @@ class GektorOrchestrator:
         # [ФАЗА 1] Репозитории и Шины (Layer 1)
         self.event_bus = EventBus()
         self.quarantine = QuarantineManager(event_bus=self.event_bus)
+        self.escrow_guard = LiquidationEchoGuard(escrow_window_ms=150)
         
         # [ФАЗА 2] Внешние адаптеры (Layer 2)
         total_cores = os.cpu_count() or 4
@@ -522,22 +523,36 @@ class GektorOrchestrator:
         
         # [КРИТИЧЕСКИЙ БАРЬЕР] Посылаем сигнал в ТГ только в момент СТАРТА импульса (фронт)
         if result.get("is_new_impulse"):
-            # [COOLDOWN CHECK] Проверяем таймаут для микроструктурных импульсов
-            last_time = self._last_alert_time.get(symbol, 0)
-            if time.time() - last_time < 3600:
-                logger.debug(f"🤐 [COOLDOWN] Micro-impulse suppressed for {symbol}")
-                return
+            # Асинхронное сожжение: запускаем проверку эскроу
+            asyncio.create_task(self._process_micro_impulse(symbol, result, snapshot))
 
-            self._last_alert_time[symbol] = time.time()
-            self.tg.notify_event({
-                "type": "MICRO_IMPULSE",
-                "symbol": symbol,
-                "side": result["state"],
-                "price": snapshot.best_bid.price, 
-                "ofi": result["ofi"],
-                "timestamp": snapshot.exchange_ts
-            })
+    async def _process_micro_impulse(self, symbol: str, result: dict, snapshot: L2Snapshot):
+        # [ESCROW ВАЛИДАЦИЯ] Спим 150мс и проверяем стрим ликвидаций
+        ofi_usd = abs(result["ofi"] * snapshot.best_bid.price)
+        is_clean = await self.escrow_guard.escort_signal(symbol, result["state"], ofi_usd)
+        
+        if not is_clean:
+            return  # Сгорел в Liquidation Echo Guard
 
+        # [COOLDOWN CHECK] Проверяем таймаут для микроструктурных импульсов
+        last_time = self._last_alert_time.get(symbol, 0)
+        if time.time() - last_time < 3600:
+            logger.debug(f"🤐 [COOLDOWN] Micro-impulse suppressed for {symbol}")
+            return
+
+        self._last_alert_time[symbol] = time.time()
+        self.tg.notify_event({
+            "type": "MICRO_IMPULSE",
+            "symbol": symbol,
+            "side": result["state"],
+            "price": snapshot.best_bid.price, 
+            "ofi": result["ofi"],
+            "timestamp": snapshot.exchange_ts
+        })
+
+    def ingest_liquidation(self, symbol: str, side: str, usd_volume: float):
+        """Инжектится из вебсокета биржи (stream.liquidation)."""
+        self.escrow_guard.register_liquidation_event(symbol, side, usd_volume)
     async def start_monitoring(self, symbol: str, seed_data: List[dict] = None) -> bool:
         """Динамическое подключение нового актива с гидратацией стейта."""
         # [GATEKEEPER] Prevent resurrecting a buried coin
