@@ -1,3 +1,4 @@
+import math
 from loguru import logger
 from dataclasses import dataclass
 from typing import Optional, Dict
@@ -15,18 +16,72 @@ class L2Snapshot:
     best_ask: L2Level
     exchange_ts: int
 
+
+class AdaptiveOFIFilter:
+    """
+    [GEKTOR v4.3] Welford Online Z-Score Filter for OFI.
+    
+    Replaces static thresholds with a rolling statistical baseline.
+    Only fires when |OFI Z-Score| > z_threshold, meaning the current OFI
+    is a true statistical outlier relative to recent market noise.
+    
+    Calibration: First `min_samples` snapshots are used to build the baseline.
+    During calibration, ALL impulses are suppressed (no false positives).
+    """
+    __slots__ = ['_k', '_m', '_s', '_min_samples', '_z_threshold']
+
+    def __init__(self, min_samples: int = 100, z_threshold: float = 2.5):
+        self._k: int = 0
+        self._m: float = 0.0
+        self._s: float = 0.0
+        self._min_samples = min_samples
+        self._z_threshold = z_threshold
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self._k >= self._min_samples
+
+    def ingest(self, ofi: float) -> float:
+        """
+        Updates running stats and returns Z-Score.
+        Returns 0.0 during calibration phase.
+        """
+        self._k += 1
+        old_m = self._m
+        self._m += (ofi - self._m) / self._k
+        self._s += (ofi - old_m) * (ofi - self._m)
+
+        if not self.is_calibrated:
+            return 0.0
+
+        variance = self._s / (self._k - 1) if self._k > 1 else 0.0
+        std = math.sqrt(max(0.0, variance))
+
+        if std < 1e-9:
+            return 0.0
+
+        return (ofi - self._m) / std
+
+    def is_true_anomaly(self, ofi: float) -> bool:
+        """Returns True only if OFI is a statistically significant outlier."""
+        z = self.ingest(ofi)
+        return abs(z) >= self._z_threshold
+
+
 class MicrostructureDefender:
     """
-    [GEKTOR v2.0] Integrity Verification Module (Phantom Liquidity Filter).
-    Used strictly for Phase 5 (Premise Invalidation) and Phase 1 (Spike Filtering).
-    NOT for scalping or market-making. 
-    Verifies that 'Informed Accumulation' is backed by realized L1 volume.
+    [GEKTOR v4.3] Integrity Verification Module (Phantom Liquidity Filter).
+    
+    Uses Adaptive Z-Score OFI filtering to eliminate HFT spoofing noise.
+    Static thresholds are retained ONLY as hysteresis release gates.
+    Signal generation requires BOTH:
+      1. Z-Score anomaly (statistical significance)
+      2. Hysteresis state transition from NEUTRAL (structural confirmation)
     """
     def __init__(self, symbol: str, confirmed_threshold: Optional[float] = None, release_factor: Optional[float] = None):
         self.symbol = symbol
         self._prev_snapshot: Optional[L2Snapshot] = None
         self._accumulated_ofi: float = 0.0
-        self._current_state = "NEUTRAL"
         
         # [INTRADAY v4.1] Адаптивные пороги в зависимости от ликвидности актива
         is_major = symbol in ["BTCUSDT", "ETHUSDT"]
@@ -41,6 +96,9 @@ class MicrostructureDefender:
         
         # [HYSTERESIS STATE MACHINE]
         self._current_state: str = "NEUTRAL" # NEUTRAL, ACCUMULATION, DISTRIBUTION
+
+        # [ADAPTIVE Z-SCORE FILTER] Welford-based noise suppressor
+        self._z_filter = AdaptiveOFIFilter(min_samples=100, z_threshold=2.5)
 
     def update_execution(self, volume: float, side: str):
         """Updates the trade volume delta since the last L2 snapshot."""
@@ -89,35 +147,40 @@ class MicrostructureDefender:
         return self._accumulated_ofi
 
     async def ingest_snapshot(self, snapshot: L2Snapshot) -> dict:
-        """Entry point for the Event Bus with Hysteresis Shield."""
+        """Entry point for the Event Bus with Adaptive Z-Score + Hysteresis Shield."""
         ofi = self.calculate_informed_ofi(snapshot)
         is_new_impulse = False
         prev_state = self._current_state
-        
-        # Logic for state transitions (Schmitt Trigger / Hysteresis)
+
+        # [GATE 0: ADAPTIVE Z-SCORE] Feed OFI into Welford filter.
+        # During calibration (first 100 snapshots), z_is_anomaly is always False.
+        # After calibration, only statistically significant OFI deviations pass.
+        z_is_anomaly = self._z_filter.is_true_anomaly(ofi)
+
+        # [HYSTERESIS STATE MACHINE] — transitions require Z-Score confirmation
         if self._current_state == "NEUTRAL":
-            if ofi > self._confirmed_threshold:
+            # Entry requires BOTH: Z-Score anomaly AND directional threshold breach
+            if z_is_anomaly and ofi > self._confirmed_threshold:
                 self._current_state = "ACCUMULATION"
                 is_new_impulse = True
                 logger.warning(f"🚨 [MICROSTRUCTURE] ACCUMULATION IMPULSE STARTED | {snapshot.symbol} | OFI: {ofi:.2f}")
-            elif ofi < -self._confirmed_threshold:
+            elif z_is_anomaly and ofi < -self._confirmed_threshold:
                 self._current_state = "DISTRIBUTION"
                 is_new_impulse = True
                 logger.warning(f"🚨 [MICROSTRUCTURE] DISTRIBUTION IMPULSE STARTED | {snapshot.symbol} | OFI: {ofi:.2f}")
 
         elif self._current_state == "ACCUMULATION":
-            # State release threshold: ofi must drop below release_threshold to reset
+            # Release does NOT require Z-Score — just mean-reversion
             if ofi < self._release_threshold:
                 self._current_state = "NEUTRAL"
         
         elif self._current_state == "DISTRIBUTION":
-            # State release threshold: ofi must rise above -release_threshold to reset
             if ofi > -self._release_threshold:
                 self._current_state = "NEUTRAL"
 
-        # Double check: is_new_impulse should only be true if state changed from NEUTRAL
+        # Safety latch: impulse only valid from NEUTRAL transition
         if is_new_impulse and prev_state != "NEUTRAL":
-            is_new_impulse = False # Safety latch
+            is_new_impulse = False
 
         return {
             "symbol": snapshot.symbol,

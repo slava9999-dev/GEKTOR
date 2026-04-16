@@ -66,14 +66,20 @@ def main():
     finally:
         # Final Sweep - THE BEAZLEY GUARDIAN
         try:
-            loop.run_until_complete(shutdown(loop, orchestrator))
-        except Exception as e:
-            logger.error(f"❌ [SHUTDOWN] Final teardown error: {e}")
+            # Timeout the shutdown to prevent hanging on dead ProcessPool queues
+            loop.run_until_complete(
+                asyncio.wait_for(shutdown(loop, orchestrator), timeout=10.0)
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.error(f"❌ [SHUTDOWN] Final teardown error (forced): {e}")
         finally:
+            # Suppress BrokenPipeError noise from killed ProcessPool workers
+            import logging
+            logging.getLogger("concurrent.futures").setLevel(logging.CRITICAL)
             if not loop.is_closed():
                 loop.close()
             logger.info("🔌 [OFFLINE]")
-            sys.exit(1)
+            sys.exit(0)
 
 if __name__ == "__main__":
     main()
